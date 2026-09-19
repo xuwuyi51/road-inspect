@@ -72,6 +72,16 @@ def select_images(repo: Repo, filters: dict[str, Any]) -> list[dict[str, Any]]:
         clauses.append("t.status IN ('annotated','reviewing','approved')")
     elif review_status == "any":
         clauses = ["i.duplicate_of IS NULL"]
+    if "image_ids" in filters:
+        # 显式指定图像集合：主动学习 A/B 对比需要"同一批图、不同选样"的可控子集。
+        # 注意用 `in filters` 而不是真值判断：显式传空列表表示"不要任何图"，
+        # 若按 falsy 处理会静默变成"全都要"，在对比实验里就是拿全量数据训练。
+        ids = [int(value) for value in filters["image_ids"]]
+        if not ids:
+            return []
+        placeholders = ",".join("?" * len(ids))
+        clauses.append(f"i.id IN ({placeholders})")
+        params.extend(ids)
     if filters.get("batch_ids"):
         placeholders = ",".join("?" * len(filters["batch_ids"]))
         clauses.append(f"i.batch_id IN ({placeholders})")

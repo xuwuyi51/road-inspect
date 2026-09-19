@@ -242,9 +242,14 @@ class Repo:
         if cursor:
             clauses.append("t.id > ?")
             params.append(cursor)
+        if strategy == "active":
+            # 只看最近一次主动学习选样命中的任务（ADR-0007 的队列视图）
+            clauses.append("EXISTS (SELECT 1 FROM active_queue q WHERE q.task_id = t.id "
+                           "AND q.run_id = (SELECT MAX(id) FROM runs WHERE kind = 'active'))")
         order = {
             "priority": "t.priority ASC, t.id ASC",
             "low_conf": "t.priority ASC, t.id ASC",  # 预标注置信度排序在 M2 引入
+            "active": "t.priority ASC, t.id ASC",
             "random": "RANDOM()",
             "fifo": "t.id ASC",
         }.get(strategy, "t.id ASC")
@@ -806,6 +811,100 @@ class Repo:
                             {"status": "production"}, {"status": "archived", "replaced_by": keep_id})
             archived.append(int(row["id"]))
         return archived
+
+    # ─────────────────── 主动学习队列（M5，ADR-0007） ───────────────────
+    def pending_signal_rows(self, *, status: str = "pending", limit: int | None = None) -> list[dict[str, Any]]:
+        """待标注任务的选样输入：任务/影像字段 + 人工框数与模型候选数（排除近似重复图像）。"""
+        sql = """SELECT t.id AS task_id, t.image_id, t.status, t.priority, t.prelabel_state,
+                        i.path, i.phash, i.width, i.height, i.batch_id, i.captured_at,
+                        i.gps_lat, i.gps_lon, i.created_at AS image_created_at,
+                        (SELECT COUNT(*) FROM annotations a WHERE a.task_id = t.id
+                           AND a.deleted_at IS NULL AND a.source <> 'model') AS human_boxes,
+                        (SELECT COUNT(*) FROM annotations a WHERE a.task_id = t.id
+                           AND a.deleted_at IS NULL AND a.source = 'model') AS model_boxes
+                 FROM tasks t JOIN images i ON i.id = t.image_id
+                 WHERE t.status = ? AND i.duplicate_of IS NULL
+                 ORDER BY t.priority ASC, t.id ASC"""
+        params: list[Any] = [status]
+        if limit:
+            sql += " LIMIT ?"
+            params.append(int(limit))
+        return _dicts(self.conn.execute(sql, params))
+
+    def model_candidates_for_tasks(self, task_ids: Sequence[int]) -> dict[int, list[dict[str, Any]]]:
+        """按任务取模型候选（`source='model'`，未软删）：{task_id: [{class_code, score}]}。"""
+        result: dict[int, list[dict[str, Any]]] = {int(task_id): [] for task_id in task_ids}
+        ids = [int(task_id) for task_id in task_ids]
+        for start in range(0, len(ids), 400):
+            chunk = ids[start:start + 400]
+            placeholders = ",".join("?" * len(chunk))
+            rows = self.conn.execute(
+                f"""SELECT task_id, class_code, score FROM annotations
+                    WHERE task_id IN ({placeholders}) AND source = 'model' AND deleted_at IS NULL
+                    ORDER BY task_id, id""", chunk)
+            for row in rows:
+                result.setdefault(int(row["task_id"]), []).append(
+                    {"class_code": row["class_code"], "score": row["score"]})
+        return result
+
+    def set_task_priorities(self, priorities: dict[int, int], *, actor: str = "system") -> int:
+        """批量写回 `tasks.priority`（数值越小越优先）。返回更新条数。"""
+        updated = 0
+        with transaction(self.conn):
+            for task_id, priority in priorities.items():
+                cursor = self.conn.execute(
+                    "UPDATE tasks SET priority = ?, updated_at = ? WHERE id = ? AND priority != ?",
+                    (int(priority), utc_now(), int(task_id), int(priority)))
+                updated += cursor.rowcount or 0
+            self._audit("task", "priority", "active_learning", actor, None,
+                        {"updated": updated, "tasks": len(priorities)})
+        return updated
+
+    def create_active_run(self, *, strategy: str, config_json: dict[str, Any] | None = None) -> dict[str, Any]:
+        """登记一次选样运行（`runs.kind='active'`）。"""
+        return self.create_run("active", config_json={"strategy": strategy, **(config_json or {})})
+
+    def add_active_queue_items(self, run_id: int, items: Sequence[dict[str, Any]], *, strategy: str) -> int:
+        """写入选样明细（审计 + 标注台说明"为什么这张优先"）。"""
+        with transaction(self.conn):
+            for item in items:
+                self.conn.execute(
+                    """INSERT INTO active_queue(run_id, task_id, image_id, strategy, score, priority,
+                                                reason, components_json, detail_json)
+                       VALUES(?,?,?,?,?,?,?,?,?)""",
+                    (int(run_id), int(item["task_id"]), int(item["image_id"]), strategy,
+                     float(item.get("score") or 0.0), int(item.get("priority") or 100),
+                     str(item.get("reason") or "score"),
+                     json.dumps(item.get("components") or {}, ensure_ascii=False, sort_keys=True),
+                     json.dumps(item.get("detail") or {}, ensure_ascii=False, sort_keys=True)))
+        return len(items)
+
+    def active_queue(self, *, run_id: int | None = None, limit: int = 500) -> list[dict[str, Any]]:
+        """选样明细（默认取最近一次运行），join 任务/影像便于直接展示。"""
+        resolved = run_id if run_id is not None else (self.latest_active_run() or {}).get("id")
+        if resolved is None:
+            return []
+        rows = self.conn.execute(
+            """SELECT q.*, t.status AS task_status, t.priority AS task_priority,
+                      i.path AS image_path, i.captured_at, i.gps_lat, i.gps_lon
+               FROM active_queue q
+               JOIN tasks t ON t.id = q.task_id
+               JOIN images i ON i.id = q.image_id
+               WHERE q.run_id = ?
+               ORDER BY q.score DESC, q.task_id ASC LIMIT ?""",
+            (int(resolved), int(limit)))
+        return _dicts(rows)
+
+    def latest_active_run(self) -> dict[str, Any] | None:
+        return _dict(self.conn.execute(
+            "SELECT * FROM runs WHERE kind = 'active' ORDER BY id DESC LIMIT 1").fetchone())
+
+    def gate_history(self, name: str, *, limit: int = 10) -> list[dict[str, Any]]:
+        """同名模型的最近若干次门禁记录（新→旧），用于"连续两次不通过"告警。"""
+        rows = self.conn.execute(
+            """SELECT id, name, version, status, gate_json, created_at FROM model_versions
+               WHERE name = ? ORDER BY id DESC LIMIT ?""", (str(name), int(limit)))
+        return _dicts(rows)
 
     # ─────────────────────── 忽略/删除标注（M2） ───────────────────────
     def delete_annotation(self, annotation_id: int, *, actor: str = "api") -> bool:

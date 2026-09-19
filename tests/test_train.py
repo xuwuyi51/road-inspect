@@ -949,3 +949,42 @@ class TestExportPackageIsolation(TrainFixture):
         self.assertEqual(manifest["model_sha256"], export_mod.sha256_file(first["model_path"]),
                          "manifest 里的哈希必须与包内实际文件一致")
         self.assertEqual(manifest["schema_version"], 1, "边缘端校验依赖 schema_version")
+
+
+class TestGateComparabilityGuards(TrainFixture):
+    """基线为 0 的类缺失不算回退；评估数据集不一致必须显式标注"不可比"（M5 加固）。"""
+
+    def test_missing_class_with_zero_baseline_is_not_regression(self) -> None:
+        baseline = _metrics(0.40, {"transverse_crack": 0.40, "garbage": 0.0})
+        candidate = _metrics(0.45, {"transverse_crack": 0.50})
+        decision = gate_mod.compare_metrics(candidate, baseline, map50_tolerance=0.005,
+                                            per_class_tolerance=0.02, min_map50=0.0)
+        self.assertTrue(decision.passed, decision.reasons)
+        self.assertTrue(any("≈0" in note for note in decision.notes), decision.notes)
+
+    def test_missing_class_with_positive_baseline_still_fails(self) -> None:
+        baseline = _metrics(0.40, {"transverse_crack": 0.40, "pothole": 0.30})
+        candidate = _metrics(0.45, {"transverse_crack": 0.50})
+        decision = gate_mod.compare_metrics(candidate, baseline, map50_tolerance=0.005,
+                                            per_class_tolerance=0.02, min_map50=0.0)
+        self.assertFalse(decision.passed)
+
+    def test_mismatched_evaluation_dataset_is_flagged(self) -> None:
+        baseline = _metrics(0.40, {"transverse_crack": 0.4})
+        baseline["manifest_hash"] = "aaaa1111"
+        candidate = _metrics(0.45, {"transverse_crack": 0.5})
+        candidate["manifest_hash"] = "bbbb2222"
+        decision = gate_mod.compare_metrics(candidate, baseline, map50_tolerance=0.005,
+                                            per_class_tolerance=0.02, min_map50=0.0)
+        self.assertFalse(decision.delta.get("comparable", True))
+        self.assertTrue(any("不是同一份冻结集" in note for note in decision.notes), decision.notes)
+
+    def test_same_dataset_is_comparable(self) -> None:
+        baseline = _metrics(0.40, {"transverse_crack": 0.4})
+        baseline["manifest_hash"] = "same"
+        candidate = _metrics(0.45, {"transverse_crack": 0.5})
+        candidate["manifest_hash"] = "same"
+        decision = gate_mod.compare_metrics(candidate, baseline, map50_tolerance=0.005,
+                                            per_class_tolerance=0.02, min_map50=0.0)
+        self.assertTrue(decision.passed)
+        self.assertNotIn("comparable", decision.delta)

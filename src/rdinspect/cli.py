@@ -1,4 +1,4 @@
-"""命令行入口：rdinspect serve|import|tasks|dataset|export|prelabel|train|model|runs|infer|stats|check。
+"""命令行入口：rdinspect serve|import|tasks|dataset|export|prelabel|train|model|runs|infer|active|report|stats|check。
 
 设计与契约见 docs/06-api-spec.md §5；退出码：0 成功 / 2 参数错误 / 3 依赖缺失 / 4 运行失败 /
 5 门禁未通过 / 6 导出包校验失败（边缘端拒绝启动）。
@@ -158,6 +158,43 @@ def _build_parser() -> argparse.ArgumentParser:
     classes.add_argument("--order", type=int, default=100, help="YOLO 类别顺序（越小越前）")
     classes.add_argument("--is-crack", action="store_true")
     classes.add_argument("--all", action="store_true", help="list 时包含已停用类别")
+
+    active = sub.add_parser("active", help="主动学习：选样排队 / 门禁告警 / 效果对比（M5）")
+    active.add_argument("action", choices=["queue", "alerts", "compare", "show"])
+    active.add_argument("--strategy", default="hybrid",
+                        choices=["hybrid", "uncertainty", "error", "diversity", "random"])
+    active.add_argument("--limit", type=int, default=100, help="选样数量上限")
+    active.add_argument("--status", default="pending", help="从哪些任务状态里选（默认 pending）")
+    active.add_argument("--package", help="导出包目录：额外用 ONNX 跑一遍拿 top1−top2 证据")
+    active.add_argument("--margin-limit", type=int, help="ONNX margin 打分最多跑多少张（默认全部候选）")
+    active.add_argument("--conf-lo", type=float, default=None)
+    active.add_argument("--conf-hi", type=float, default=None)
+    active.add_argument("--margin-threshold", type=float, default=None)
+    active.add_argument("--diversity-ratio", type=float, default=None)
+    active.add_argument("--phash-hamming", type=int, default=None)
+    active.add_argument("--empty-weight", type=float, default=0.0,
+                        help="零候选图的不确定性权重（默认 0：空路面不浪费标注预算）")
+    active.add_argument("--include-labeled", action="store_true", help="已有人工标注的图也参与选样")
+    active.add_argument("--scan-limit", type=int, help="候选池扫描上限（默认全部待标注任务）")
+    active.add_argument("--dry-run", action="store_true", help="只算不写（不改进优先级、不落明细）")
+    active.add_argument("--run-id", type=int, help="show 时指定选样运行")
+    active.add_argument("--baseline", type=int, help="compare：基线模型 id")
+    active.add_argument("--candidate", type=int, help="compare：主动学习模型 id")
+    active.add_argument("--labeled", type=int, default=0, help="compare：两者各自用了多少张标注")
+    active.add_argument("--threshold", type=int, default=2, help="alerts：连续几次不通过算告警")
+    active.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
+
+    report = sub.add_parser("report", help="统计报表：时间趋势 / 批次对比 / GIS 导出（M5）")
+    report.add_argument("--days", type=int, default=30)
+    report.add_argument("--bucket", default="day", choices=["day", "week", "month"])
+    report.add_argument("--batch-limit", type=int, default=20)
+    report.add_argument("--format", default="markdown", choices=["markdown", "json", "gis-geojson", "gis-csv"])
+    report.add_argument("--out", help="写入文件（默认打印到 stdout）")
+    report.add_argument("--classes", help="GIS 导出：类别 code，逗号分隔")
+    report.add_argument("--since"), report.add_argument("--until")
+    report.add_argument("--bbox", help="GIS 导出：min_lon,min_lat,max_lon,max_lat")
+    report.add_argument("--gis-limit", type=int, default=20000)
+    report.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
 
     stats = sub.add_parser("stats", help="统计概览")
     stats.add_argument("--export", choices=["csv", "json"], help="导出标注明细")
@@ -645,6 +682,128 @@ def _cmd_classes(args: argparse.Namespace, config: Config) -> int:
         conn.close()
 
 
+def _cmd_active(args: argparse.Namespace, config: Config) -> int:
+    from .active import service as active_service
+    from .active import scoring as active_scoring
+
+    conn = init_db(config.db_path)
+    repo = Repo(conn)
+    try:
+        if args.action == "show":
+            run = repo.latest_active_run() if not args.run_id else repo.get_run(args.run_id)
+            if run is None:
+                print("还没有选样运行：先执行 rdinspect active queue", file=sys.stderr)
+                return EXIT_RUN
+            items = repo.active_queue(run_id=int(run["id"]), limit=args.limit)
+            payload = {"run": run, "items": items}
+            _print(args, payload, text=(
+                f"选样运行 #{run['id']}（{run['status']}）｜明细 {len(items)} 条\n"
+                + "\n".join(f"  task {item['task_id']:<5} score {item['score']:.3f} "
+                             f"priority {item['priority']:<4} {item['reason']:<11} {item['image_path']}"
+                             for item in items[:20])))
+            return EXIT_OK
+        if args.action == "alerts":
+            payload = active_service.gate_alerts(config, repo, threshold=args.threshold)
+            text = ("没有连续门禁失败的模型" if not payload["alerts"] else
+                    "\n".join(f"⚠️ {alert['model']}：连续 {alert['streak']} 次门禁未通过 → {alert['action']}"
+                               for alert in payload["alerts"]))
+            _print(args, payload, text=text)
+            return EXIT_OK if not payload["alerts"] else EXIT_GATE
+        if args.action == "compare":
+            if not args.baseline or not args.candidate:
+                print("compare 需要 --baseline 与 --candidate（模型 id）", file=sys.stderr)
+                return EXIT_ARGS
+            baseline_row = repo.get_model_version(args.baseline)
+            candidate_row = repo.get_model_version(args.candidate)
+            if baseline_row is None or candidate_row is None:
+                print("模型不存在", file=sys.stderr)
+                return EXIT_RUN
+            from .train.gate import evaluation_of
+
+            record = active_scoring.budget_effect(evaluation_of(baseline_row), evaluation_of(candidate_row),
+                                                  labeled_images=args.labeled or 0)
+            record["models"] = {"baseline": f"{baseline_row['name']}:{baseline_row['version']}",
+                                "active": f"{candidate_row['name']}:{candidate_row['version']}"}
+            directory = config.data_dir / "reports"
+            directory.mkdir(parents=True, exist_ok=True)
+            target = directory / f"active-compare-{args.baseline}-vs-{args.candidate}.json"
+            target.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
+            _print(args, record, text=(
+                f"基线 mAP50 {record['baseline_map50']:.4f} → 主动学习 {record['active_map50']:.4f}"
+                f"（Δ {record['delta_map50']:+.4f}，每 100 张标注 {record['per_100_images']:+.4f}）"
+                f"｜结论：{record['verdict']}\n记录：{target}"))
+            return EXIT_OK
+        from .config import PrelabelConfig
+
+        defaults = PrelabelConfig()
+        conf_lo = args.conf_lo if args.conf_lo is not None else active_scoring.DEFAULT_CONF_BAND[0]
+        conf_hi = args.conf_hi if args.conf_hi is not None else active_scoring.DEFAULT_CONF_BAND[1]
+        report = active_service.build_queue(
+            config, repo, limit=args.limit, strategy=args.strategy, status=args.status,
+            conf_band=(conf_lo, conf_hi),
+            margin_threshold=(args.margin_threshold if args.margin_threshold is not None
+                              else active_scoring.DEFAULT_MARGIN),
+            diversity_ratio=(args.diversity_ratio if args.diversity_ratio is not None
+                             else active_scoring.DEFAULT_WEIGHTS["diversity"]),
+            phash_hamming=(args.phash_hamming if args.phash_hamming is not None else 6),
+            empty_weight=args.empty_weight, package_dir=args.package, margin_limit=args.margin_limit,
+            apply=not args.dry_run, actor="cli", include_labeled=args.include_labeled,
+            scan_limit=args.scan_limit)
+        _ = defaults
+    finally:
+        conn.close()
+    payload = report.as_dict(include_items=False)
+    summary = report.summary
+    text = (f"策略 {report.strategy}｜候选 {report.candidates}｜选中 {report.selected}"
+            f"｜更新优先级 {report.updated_priorities}"
+            f"{'（dry-run 未写库）' if report.dry_run else ''}\n"
+            f"  理由分布 {summary.get('reasons')}｜分数 {summary.get('score')}\n"
+            f"  弱类 {list((summary.get('weak_classes') or {}).keys())}"
+            f"｜高混淆类 {list((summary.get('confusion_weights') or {}).keys())}"
+            + (f"\n  产物 {report.artifact}" if report.artifact else ""))
+    _print(args, payload, text=text)
+    return EXIT_OK
+
+
+def _cmd_report(args: argparse.Namespace, config: Config) -> int:
+    from . import report as report_mod
+
+    conn = init_db(config.db_path)
+    repo = Repo(conn)
+    try:
+        if args.format in ("gis-geojson", "gis-csv"):
+            classes = [item.strip() for item in args.classes.split(",")] if args.classes else None
+            bbox = tuple(float(part) for part in args.bbox.split(",")) if args.bbox else None
+            payload = report_mod.gis_features(repo, classes=classes, since=args.since, until=args.until,
+                                              limit=args.gis_limit, bbox=bbox)  # type: ignore[arg-type]
+            if args.format == "gis-geojson":
+                text = json.dumps(report_mod.to_geojson(payload, metadata={"generated_at": _now_iso()}),
+                                  ensure_ascii=False, indent=2)
+            else:
+                text = report_mod.to_gis_csv(payload)
+            _ = payload
+        else:
+            summary = report_mod.summary(repo, days=args.days, bucket=args.bucket,
+                                         batch_limit=args.batch_limit)
+            text = (json.dumps(summary, ensure_ascii=False, indent=2) if args.format == "json"
+                    else report_mod.render_markdown(summary))
+            payload = summary
+    finally:
+        conn.close()
+    if args.out:
+        Path(args.out).write_text(text if text.endswith("\n") else text + "\n", encoding="utf-8")
+        print(f"已写入 {args.out}")
+    else:
+        print(text)
+    return EXIT_OK
+
+
+def _now_iso() -> str:
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def _cmd_stats(args: argparse.Namespace, config: Config) -> int:
     conn = init_db(config.db_path)
     repo = Repo(conn)
@@ -731,6 +890,7 @@ def main(argv: list[str] | None = None) -> int:
         "thumbs": _cmd_thumbs, "check": _cmd_check, "prelabel": _cmd_prelabel,
         "prelabel-metrics": _cmd_prelabel_metrics, "models": _cmd_models, "classes": _cmd_classes,
         "train": _cmd_train, "runs": _cmd_runs, "model": _cmd_model, "infer": _cmd_infer,
+        "active": _cmd_active, "report": _cmd_report,
     }
     handler = handlers[args.command]
     if args.command == "dataset" and args.action == "freeze" and not args.name:

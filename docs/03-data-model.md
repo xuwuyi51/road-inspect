@@ -1,6 +1,6 @@
 # 03 · 数据模型（Data Model）
 
-> DDL 已交付并通过自检：`db/schema.sql` 在本机执行后可建 **13 张表 / 18 个索引 / 2 个视图 / 2 个触发器**，内置 5 个类别（含预留的网裂）。
+> DDL 已交付并通过自检：`db/schema.sql` 在本机执行后可建 **14 张表 / 22 个索引 / 2 个视图 / 2 个触发器**，内置 5 个类别（含预留的网裂）。
 
 ## 1. 实体关系总览
 
@@ -33,8 +33,9 @@ audit_log：横切所有实体的写操作留痕（entity/entity_id/action/befor
 | `reviews` | 复核记录 | `decision ∈ {approve,reject}` + `reason_code` 六类 |
 | `dataset_versions` | 数据集版本 | `status ∈ {draft,frozen,archived}`；冻结后写 `class_order_json` 与 `manifest_hash` |
 | `dataset_items` | 数据集成员与划分 | 主键 `(dataset_id,image_id)`；`split ∈ {train,val,test}` |
-| `runs` | 任务运行记录（导入/预标注/训练/评估/导出） | `run_key` 唯一 → 幂等；M3 起训练进度按 epoch 增量写 `metrics_json.progress`，结束时 `metrics_json` 收敛为 `{weights_path,last_weights,work_dir,final,epochs_done,resumed,train_params}` |
+| `runs` | 任务运行记录（导入/预标注/训练/评估/导出/**主动学习选样**） | `run_key` 唯一 → 幂等；M3 起训练进度按 epoch 增量写 `metrics_json.progress`，结束时 `metrics_json` 收敛为 `{weights_path,last_weights,work_dir,final,epochs_done,resumed,train_params}` |
 | `model_versions` | 模型注册表 | `status ∈ {candidate,validated,production,archived}`；`metrics_json = {train, train_params, evaluation, log_path}`；`gate_json` 存门禁结论（passed/reasons/delta/baseline/thresholds）；`onnx_path` 指向导出包里的 `model.onnx` |
+| `active_queue` | 主动学习选样明细（M5） | 记录得分/理由/证据；`tasks.priority` 是执行面，本表是审计与复盘面；`run_id` 指向 `runs.kind='active'` |
 | `audit_log` | 审计 | 标注增删改、数据集冻结、模型晋级全部留痕 |
 
 视图：`v_task_queue`（待办队列，含优先级）、`v_class_counts`（各类别标注数）。

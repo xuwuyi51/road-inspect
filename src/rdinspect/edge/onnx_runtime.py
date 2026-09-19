@@ -91,8 +91,12 @@ def letterbox(image: Image.Image, imgsz: int | tuple[int, int] = 640, *,
 
 
 def decode_predictions(output: np.ndarray, meta: LetterboxMeta, *, conf: float,
-                       class_names: Sequence[str]) -> list[dict[str, Any]]:
-    """YOLO 检测头输出 (1, 4+nc, N) 或 (1, N, 4+nc) → 原图像素坐标的候选框（未做 NMS）。"""
+                       class_names: Sequence[str], topk: int = 1) -> list[dict[str, Any]]:
+    """YOLO 检测头输出 (1, 4+nc, N) 或 (1, N, 4+nc) → 原图像素坐标的候选框（未做 NMS）。
+
+    @param topk - >1 时额外返回 `topk`（[[class_index, score], …]）与 `margin`（top1−top2），
+                  供主动学习判断"模型在两个类别之间摇摆"（ADR-0007）。
+    """
     array = np.asarray(output)
     if array.ndim == 3:
         array = array[0]
@@ -109,6 +113,9 @@ def decode_predictions(output: np.ndarray, meta: LetterboxMeta, *, conf: float,
     class_ids = scores.argmax(axis=1)
     confidences = scores[np.arange(scores.shape[0]), class_ids]
     keep = confidences >= float(conf)
+    topk_values: np.ndarray | None = None
+    if topk > 1 and scores.shape[1] > 1:
+        topk_values = np.argsort(-scores, axis=1)[:, : int(topk)]
     results: list[dict[str, Any]] = []
     for index in np.nonzero(keep)[0]:
         cx, cy, bw, bh = (float(value) for value in boxes_xywh[index])
@@ -116,8 +123,13 @@ def decode_predictions(output: np.ndarray, meta: LetterboxMeta, *, conf: float,
         x2, y2 = meta.undo(cx + bw / 2.0, cy + bh / 2.0)
         class_id = int(class_ids[index])
         name = class_names[class_id] if 0 <= class_id < len(class_names) else str(class_id)
-        results.append({"class_index": class_id, "class_name": name,
-                        "score": float(confidences[index]), "bbox": (x1, y1, x2, y2)})
+        entry = {"class_index": class_id, "class_name": name,
+                 "score": float(confidences[index]), "bbox": (x1, y1, x2, y2)}
+        if topk_values is not None and index < topk_values.shape[0]:
+            ranked = [(int(column), float(scores[index, column])) for column in topk_values[index]]
+            entry["topk"] = ranked
+            entry["margin"] = round(ranked[0][1] - ranked[1][1], 6) if len(ranked) > 1 else None
+        results.append(entry)
     return results
 
 

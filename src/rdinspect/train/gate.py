@@ -114,6 +114,16 @@ def compare_metrics(candidate: dict[str, Any], baseline: dict[str, Any] | None,
             if recall < min_class_recall:
                 reasons.append(f"类别 {code} 召回 {recall:.4f} 低于下限 {min_class_recall:.4f}")
 
+    comparable = True
+    if baseline:
+        base_hash = (baseline.get("dataset_manifest_hash") or (baseline.get("dataset") and None)
+                     or baseline.get("manifest_hash"))
+        cand_hash = (candidate.get("dataset_manifest_hash") or candidate.get("manifest_hash"))
+        if base_hash and cand_hash and str(base_hash) != str(cand_hash):
+            comparable = False
+            notes.append(f"⚠️ 基线与候选的评估数据不是同一份冻结集（{str(base_hash)[:8]}… vs "
+                         f"{str(cand_hash)[:8]}…）：指标不可直接比较，建议用同一冻结测试集复评"
+                         f"（rdinspect model evaluate --id N --split test）")
     base_map50 = primary_map50(baseline) if baseline else None
     if baseline and base_map50 is not None and cand_map50 is not None:
         delta["map50"] = round(cand_map50 - base_map50, 6)
@@ -125,8 +135,13 @@ def compare_metrics(candidate: dict[str, Any], baseline: dict[str, Any] | None,
         for code, value in sorted(base_per_class.items()):
             candidate_value = cand_per_class.get(code)
             if candidate_value is None:
-                reasons.append(f"类别 {code} 在候选模型中缺失（基线 {value:.4f}）")
-                per_class_delta[code] = -value
+                if value > per_class_tolerance:
+                    reasons.append(f"类别 {code} 在候选模型中缺失（基线 {value:.4f}）")
+                    per_class_delta[code] = -value
+                else:
+                    # 基线本身接近 0：缺失不代表变差（多半是该类在评估集里没有实例）
+                    notes.append(f"类别 {code} 在候选模型中没有指标（基线 {value:.4f}≈0，忽略）")
+                    per_class_delta[code] = 0.0
                 continue
             per_class_delta[code] = round(candidate_value - value, 6)
             if per_class_delta[code] < -per_class_tolerance:
@@ -147,15 +162,19 @@ def compare_metrics(candidate: dict[str, Any], baseline: dict[str, Any] | None,
                      f"（gate.min_map50={min_map50}）：请在 configs/train.yaml 设置一个真实的绝对下限"
                      f"（例如 0.30），或补足训练轮次/数据后再提升生产")
 
+    if not comparable:
+        delta["comparable"] = False
     return GateDecision(
         passed=not reasons, reasons=reasons, notes=notes, delta=delta,
         baseline=({"label": baseline_label, "map50": base_map50,
+                   "manifest_hash": baseline.get("manifest_hash"),
                    "model": (baseline.get("model") if isinstance(baseline, dict) else None)}
                   if baseline else None),
         candidate_summary={"map50": cand_map50, "per_class_map50": cand_per_class,
                            "weights": candidate.get("weights"),
                            "weights_sha256": candidate.get("weights_sha256"),
-                           "split": candidate.get("split"), "dataset": candidate.get("dataset")},
+                           "split": candidate.get("split"), "dataset": candidate.get("dataset"),
+                           "manifest_hash": candidate.get("manifest_hash")},
         thresholds=thresholds,
     )
 
@@ -182,19 +201,31 @@ def find_baseline(config: Config, repo: Repo, candidate: dict[str, Any]) -> tupl
 
 # ─────────────────────────── 高层动作 ───────────────────────────
 def evaluate_model(config: Config, repo: Repo, model_id: int, *, split: str | None = None,
+                   dataset: str | dict[str, Any] | None = None,
                    detector_factory: Callable[[Config, str], Detector] | None = None,
                    actor: str = "system", persist: bool = True) -> dict[str, Any]:
-    """评估模型并把结果写回 runs + model_versions.metrics_json.evaluation。"""
+    """评估模型并把结果写回 runs + model_versions.metrics_json.evaluation。
+
+    @param dataset - 指定评估用的数据集（名称或行）。默认用模型自己登记的数据集；
+                     主动学习实验需要"多个模型在同一冻结测试集上比较"，因此必须能外部指定。
+    """
     row = repo.get_model_version(model_id)
     if row is None:
         raise NotFoundError(f"模型 {model_id} 不存在")
     weights = row.get("weights_path")
     if not weights or not Path(weights).exists():
         raise NotFoundError(f"模型 {model_id} 的权重文件不存在: {weights}")
-    dataset_id = row.get("dataset_id")
-    dataset = repo.get_dataset(dataset_id=dataset_id) if dataset_id else None
+    resolved_dataset = dataset
+    if isinstance(resolved_dataset, str):
+        resolved_dataset = repo.get_dataset(name=resolved_dataset)
+        if resolved_dataset is None:
+            raise NotFoundError(f"数据集不存在: {dataset}")
+    if resolved_dataset is None:
+        dataset_id = row.get("dataset_id")
+        resolved_dataset = repo.get_dataset(dataset_id=dataset_id) if dataset_id else None
+    dataset = resolved_dataset
     if dataset is None:
-        raise ConflictError(f"模型 {model_id} 未关联数据集（dataset_id={dataset_id}），无法评估")
+        raise ConflictError(f"模型 {model_id} 未关联数据集（dataset_id={row.get('dataset_id')}），无法评估")
     resolved_split = split or (config.train.evaluate.splits[0] if config.train.evaluate.splits else "val")
     run = repo.create_run("evaluate", dataset_id=int(dataset["id"]), model_id=int(model_id),
                           config_json={"model": f"{row['name']}:{row['version']}", "weights": weights,

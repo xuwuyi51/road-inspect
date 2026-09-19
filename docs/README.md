@@ -17,6 +17,7 @@
 | 10 | [oss-survey](./10-oss-survey.md) | 开源项目调研与取舍（含许可） |
 | 11 | [training-guide](./11-training-guide.md) | M3 训练闭环操作手册：训练→评估→门禁→导出与排障速查 |
 | 12 | [edge-inference](./12-edge-inference.md) | M4 边缘离线推理操作手册：离线打包、infer 用法、输出契约、性能与包校验 |
+| 13 | [active-learning](./13-active-learning.md) | M5 主动学习与类别扩展：三类选样策略、同预算 A/B、增量重训与告警、报表与 GIS 导出 |
 | — | [adr/](./adr/) | ADR-0001 ~ 0007 关键决策 |
 | — | [format-samples/](./format-samples/) | YOLO/COCO/LabelMe 三格式样例与对照表 |
 
@@ -45,4 +46,5 @@
 | v1.0 | 2026-09-12 | 初版：M0 架构与文档交付（含 DDL、OpenAPI 草案、格式样例、7 份 ADR） |
 | v1.1 | 2026-09-19 | M1 采集标注闭环 + M2 模型辅助标注落地，文档同步实测数据 |
 | v1.2 | 2026-09-19 | M3 训练闭环与门禁落地：新增 11-training-guide；05/06/08/09 与 openapi 同步 M3 端点与实测结果 |
+| v1.4 | 2026-09-19 | M5 主动学习与类别扩展落地：新增 13-active-learning 与 `active_queue` 表（migration 0002）；06 补 M5 端点 |
 | v1.3 | 2026-09-19 | M4 边缘离线推理落地：新增 12-edge-inference；06 §8 改为已实现契约（新增退出码 6）、08/09 同步实测数据 |

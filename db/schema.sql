@@ -170,7 +170,7 @@ CREATE INDEX IF NOT EXISTS idx_dataset_items_split ON dataset_items(dataset_id, 
 -- ─────────────────────────── 运行记录（训练/预标注/导出/导入） ───────────────────────────
 CREATE TABLE IF NOT EXISTS runs (
   id            INTEGER PRIMARY KEY AUTOINCREMENT,
-  kind          TEXT NOT NULL CHECK (kind IN ('ingest','prelabel','train','evaluate','export')),
+  kind          TEXT NOT NULL CHECK (kind IN ('ingest','prelabel','train','evaluate','export','active')),
   status        TEXT NOT NULL DEFAULT 'queued' CHECK (status IN ('queued','running','succeeded','failed','canceled')),
   run_key       TEXT UNIQUE,                    -- 幂等键
   config_json   TEXT NOT NULL DEFAULT '{}',
@@ -245,6 +245,27 @@ FROM annotations a JOIN classes c ON c.code = a.class_code
 WHERE a.deleted_at IS NULL
 GROUP BY a.class_code, c.name_zh
 ORDER BY n DESC;
+
+-- ─────────────────────────── 主动学习队列（M5） ───────────────────────────
+-- 记录"哪些任务被选中、为什么、得分多少"；tasks.priority 是执行面，本表是审计与复盘面。
+CREATE TABLE IF NOT EXISTS active_queue (
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id          INTEGER REFERENCES runs(id) ON DELETE SET NULL,
+  task_id         INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  image_id        INTEGER NOT NULL REFERENCES images(id) ON DELETE CASCADE,
+  strategy        TEXT NOT NULL DEFAULT 'hybrid',
+  score           REAL NOT NULL DEFAULT 0,
+  priority        INTEGER NOT NULL DEFAULT 100,
+  reason          TEXT NOT NULL DEFAULT 'score',      -- score | uncertainty | error | diversity | random
+  components_json TEXT NOT NULL DEFAULT '{}',         -- {uncertainty, error, diversity}
+  detail_json     TEXT NOT NULL DEFAULT '{}',         -- 证据来源、命中类别等
+  created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_active_queue_run ON active_queue(run_id);
+CREATE INDEX IF NOT EXISTS idx_active_queue_task ON active_queue(task_id);
+CREATE INDEX IF NOT EXISTS idx_active_queue_image ON active_queue(image_id);
+CREATE INDEX IF NOT EXISTS idx_active_queue_score ON active_queue(score DESC);
 
 -- ─────────────────────────── 初始类别（可扩展） ───────────────────────────
 INSERT OR IGNORE INTO classes(code, name_zh, name_en, color, is_crack, order_index) VALUES

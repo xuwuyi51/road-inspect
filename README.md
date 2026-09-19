@@ -2,7 +2,7 @@
 
 > 识别道路上 **横向裂缝 / 纵向裂缝 / 坑洞 / 垃圾** 四类灾害（可扩展），支持**人工标注**与**模型辅助标注**，
 > 覆盖「采集 → 标注 → 训练 → 导出 → 边缘离线推理」全链路。
-> **当前状态：M0（架构文档）· M1（采集标注闭环）· M2（模型辅助标注）· M3（训练闭环与门禁）· M4（边缘离线推理）均已交付并在本机实测通过。**
+> **当前状态：M0（架构文档）· M1（采集标注闭环）· M2（模型辅助标注）· M3（训练闭环与门禁）· M4（边缘离线推理）· M5（主动学习与类别扩展）均已交付并在本机实测通过。**
 
 ## 为什么做这个
 
@@ -35,6 +35,7 @@ src/rdinspect/   实现代码（M1 + M2）
 
 0. [docs/11-training-guide.md](docs/11-training-guide.md) — **M3 训练闭环操作手册**（训练→评估→门禁→导出）
 0. [docs/12-edge-inference.md](docs/12-edge-inference.md) — **M4 边缘推理操作手册**（离线打包→推理→排障）
+0. [docs/13-active-learning.md](docs/13-active-learning.md) — **M5 主动学习操作手册**（选样→A/B→扩类→报表）
 1. [docs/00-overview.md](docs/00-overview.md) — 目标、范围、术语
 2. [docs/02-architecture.md](docs/02-architecture.md) — 架构、数据流、时序、扩展点
 3. [docs/03-data-model.md](docs/03-data-model.md) + [db/schema.sql](db/schema.sql) — 数据模型与建库
@@ -48,7 +49,7 @@ src/rdinspect/   实现代码（M1 + M2）
 
 | 检查 | 覆盖内容 | 结果 |
 |---|---|---|
-| 数据库 DDL | `db/schema.sql` 建库、表/索引/视图/触发器、CHECK 约束生效 | 13 表 / 18 索引 / 2 视图 / 2 触发器 / 5 类别 |
+| 数据库 DDL | `db/schema.sql` 建库、表/索引/视图/触发器、CHECK 约束生效 | 14 表 / 22 索引 / 2 视图 / 2 触发器 / 5 类别 |
 | OpenAPI 草案 | `docs/openapi.yaml` 结构、状态码、`$ref` 完整性 | 25 路径 / 29 操作 / 17 schema / 29 引用 |
 | 格式样例 | YOLO ↔ COCO ↔ LabelMe 归一化坐标零误差 | 4 类 × 3 格式往返一致 |
 | 配置与文档 | 4 份 YAML 可解析、文档内相对链接可达 | 60 条链接全部可达 |
@@ -73,7 +74,7 @@ src/rdinspect/   实现代码（M1 + M2）
 - **M2 ✅**：模型辅助标注——检测器抽象 + **切片推理（SAHI 策略）**、批量/单图预标注（候选落库 `source=model`）、**候选逐条采纳/忽略**、**SAM 裂缝掩膜**（宽度/长度派生指标）、**预标注质量看板**（采纳率、模型-人工 IoU）、类别扩展 CLI；未装 ML 依赖时端点返回 501，人工流程不受影响。
 - **M3 ✅（当前）**：训练闭环与门禁——ultralytics 微调 runner（**日志流 + 断点 + `flipud=0` 硬约束 + run_key 幂等**）、**分类别评估**（官方 val 口径 + 混淆矩阵 + 大小桶召回 + **切片开关对比** + 失败样例叠加图）、**模型门禁**（`candidate→validated→production`，劣化权重 409 拒绝并给出 delta）、**ONNX 导出包**（labels/preprocess/manifest/parity，**一致性验收 ≤1e-3**）、后台训练 API 与 `train`/`runs`/`model` CLI；未装 ML 依赖时返回 501。
 - **M4 ✅（当前）**：边缘离线推理——`rdinspect infer`（目录/单图/视频/RTSP、**JSONL+CSV**、**断点续跑**、切片开关、命中快照、**性能基准**）、**启动前导出包校验**（schema 版本/模型 sha256/类别顺序/输出通道/**模型内嵌 names**，任一不匹配退出码 6 拒绝启动）、**离线安装包**（`scripts/build_edge_bundle.py` 生成 wheels+模型+脚本，`--verify` 在临时 venv 里离线安装并冒烟推理）；推理链路**不依赖 torch/ultralytics/数据库**。
-- **M5 起**：主动学习选样与类别扩展（见 [docs/09-roadmap.md](docs/09-roadmap.md)）。
+- **M5 ✅（当前）**：主动学习与类别扩展——三类选样策略（**不确定性 50% + 错误驱动 30% + 多样性 20%**，ADR-0007）写回 `tasks.priority` 与 `active_queue` 明细、`--package` 时用 ONNX 取 **top1−top2** 证据、**同预算 A/B 效果对比**记录、**连续两次门禁失败 → 回看标注规范**告警、**新增类别不改代码**跑通全链路、统计报表（时间趋势/批次对比/类别覆盖/**GIS GeoJSON+CSV 导出**）。
 
 ## 快速开始（M1 + M2 + M3 + M4）
 
@@ -125,16 +126,26 @@ python3 scripts/build_edge_bundle.py --package data/exports/<name>-<version>-320
 .venv/bin/rdinspect infer --package <导出包> --input patrol.mp4 --fps 2 --out ./edge-out   # 视频抽帧
 .venv/bin/rdinspect infer --package <导出包> --input /mnt/sd --out ./bench --benchmark 60  # 性能基准
 
-# 9) 类别扩展（无需改代码；顺序变化需新建数据集版本）
+# 9) 主动学习：选样排队 → 标注台按队列标 → 同预算 A/B 对比
+.venv/bin/rdinspect active queue --limit 100 --strategy hybrid --package data/exports/<name>-<version>-320
+.venv/bin/rdinspect active show                       # 选样明细（得分/理由/证据）
+.venv/bin/rdinspect active alerts --threshold 2        # 连续两次门禁不通过 → 回看标注规范
+.venv/bin/rdinspect active compare --baseline 3 --candidate 4 --labeled 80   # 单位标注量的 mAP 增量
+
+# 10) 统计报表（时间趋势 / 批次对比 / 类别覆盖 / GIS 导出）
+.venv/bin/rdinspect report --format markdown --days 30
+.venv/bin/rdinspect report --format gis-geojson --classes transverse_crack --out /tmp/hits.geojson
+
+# 11) 类别扩展（无需改代码；顺序变化需新建数据集版本）
 .venv/bin/rdinspect classes add --code water_puddle --zh 积水 --en "Water Puddle" --order 10
 
-# 10) 统计与自检
+# 12) 统计与自检
 .venv/bin/rdinspect stats --export csv
 .venv/bin/rdinspect check
 ```
 
 > 训练/评估/门禁/导出的完整操作手册见 [docs/11-training-guide.md](docs/11-training-guide.md)；
-> 边缘打包与推理见 [docs/12-edge-inference.md](docs/12-edge-inference.md)。
+> 边缘打包与推理见 [docs/12-edge-inference.md](docs/12-edge-inference.md)；主动学习与扩类见 [docs/13-active-learning.md](docs/13-active-learning.md)。
 
 权重下载（国内网络建议走镜像，详见 [docs/05-model-plan.md](docs/05-model-plan.md#51-可直接使用的公开权重m2-实测)）：
 病害检测用 `rezzzq/yolo12s-road-damage-rdd2022`（MIT，RDD2022 训练）放 `data/weights/`；裂缝掩膜用
@@ -148,12 +159,13 @@ python3 scripts/e2e_m1.py --photos 500 --per-class 50                  # M1 端�
 python3 scripts/e2e_m2.py                                              # M2 端到端验收（含真实权重）
 .venv/bin/python scripts/e2e_m3.py --photos 120 --epochs 30 --imgsz 320 # M3 端到端验收（真机训练，约 95 秒）
 .venv/bin/python scripts/e2e_m4.py --package <导出包目录>                 # M4 端到端验收（离线/续跑/性能，约 1 分钟）
+.venv/bin/python scripts/e2e_m5.py --photos 160 --epochs 15                # M5 端到端验收（选样/A-B/扩类/报表，约 2.5 分钟）
 ```
 
 ## 测试
 
 ```bash
-PYTHONPATH=src:tests .venv/bin/python -m unittest discover -s tests -t .   # 232 项单测
+PYTHONPATH=src:tests .venv/bin/python -m unittest discover -s tests -t .   # 301 项单测
 python3 scripts/check_docs.py                                              # 文档/DDL/OpenAPI/样例自检
 python3 scripts/e2e_m1.py                                                  # M1 端到端验收（合成素材）
 python3 scripts/e2e_m2.py                                                  # M2 端到端验收（预标注/采纳/掩膜）
@@ -163,9 +175,10 @@ node scripts/check_annotator_ui.mjs                                        # 标
 
 | 测试层 | 覆盖 | 结果 |
 |---|---|---|
-| 单测（232 项，1 跳过） | 几何换算、pHash 去重、EXIF/质量指标、导入幂等、任务租约、标注差异+审计、复核状态机、数据集划分/冻结/哈希稳定、三格式往返、HTTP 契约（含 400/404/409/501 语义）、预标注幂等与 NMS/切片、类别映射、采纳指标、掩膜派生指标、**检测匹配/AP/混淆矩阵/大小桶**、**训练硬约束与幂等键**、**门禁判定与状态机**、**导出包与 ONNX 预处理几何**、**边缘包校验/输出契约/断点续跑** | 全部通过 |
+| 单测（301 项，1 跳过） | 几何换算、pHash 去重、EXIF/质量指标、导入幂等、任务租约、标注差异+审计、复核状态机、数据集划分/冻结/哈希稳定、三格式往返、HTTP 契约（含 400/404/409/501 语义）、预标注幂等与 NMS/切片、类别映射、采纳指标、掩膜派生指标、**检测匹配/AP/混淆矩阵/大小桶**、**训练硬约束与幂等键**、**门禁判定与状态机**、**导出包与 ONNX 预处理几何**、**边缘包校验/输出契约/断点续跑**、**主动学习打分与队列**、**报表口径（趋势/批次/GIS）** | 全部通过 |
 | 端到端 M1 | 500 张合成照片 + 1 段视频 → 导入 → 四类各 50 张标注复核 → 冻结导出 → 往返零误差 → 哈希可复现 | 通过 |
 | 端到端 M2 | 200 张预标注 → 采纳 120/忽略 40/待处理 40（采纳率 0.60、模型-人工 IoU 0.8626）→ 冻结导出 → 无模型时 501 降级 → 真实 RDD 权重映射率 1.00（18 候选） → SAM 掩膜宽度/长度派生 | 6/6 通过 |
+| 端到端 M5 | 160 张图 → 种子模型 → 76 候选选 40（写优先级+明细+`strategy=active` 视图）→ **同预算 A/B：随机 0.166 vs 主动 0.209（Δ +0.043）** → **新增 water_puddle 全链路（包内 6 类）** → 连续两次门禁失败告警 → 报表/GIS 导出 | 6/6 通过 |
 | 端到端 M4 | 无网代理（死端口）下 200 张图推理 → 断点续跑（100+100，重复 0）→ 与工作站逐框误差 **1e-06** → 四类篡改包**退出码 6 拒绝启动** → 640@4线程 **43.7 FPS**（目标 ≥15）→ 离线安装包 `--verify` 目标机模拟通过（整包 59MB） | 8/8 通过 |
 | 端到端 M3 | 120 张合成图（202 真值框）冻结 → 30 epoch 微调（CPU 66s，末轮 mAP50 0.9345）→ val 评估官方 mAP50 **0.9125** / 内部口径 0.9167 → 首个模型按绝对下限过门禁并提升 production → **COCO 劣化权重被 409 拒绝**（整体 −0.9125 + 4 类类别塌陷）→ ONNX 导出**逐框坐标误差 1e-06**（容差 1e-3）→ HTTP 契约（注册表/运行详情/门禁 409）→ 同参数重复提交复用 run（0.0s） | 13/13 通过 |
 
@@ -186,13 +199,15 @@ src/rdinspect/
 │                         evaluate(分类别指标/混淆矩阵/切片对比/失败样例) ·
 │                         gate(门禁状态机) · export_onnx(导出包+一致性验收) ·
 │                         service(后台任务) · compat(受限容器兼容)
+├── active/               scoring(选样打分) · service(队列/告警编排)
+├── report.py             统计报表（趋势/批次/覆盖/GIS 导出）
 ├── edge/                 package(启动前校验) · sources(目录/视频/流) ·
 │                         writers(JSONL/CSV/断点状态) · infer(编排+基准) ·
 │                         onnx_runtime(letterbox/解码/NMS)
 └── api/                  FastAPI 应用 + 静态标注台（单文件 1644 行、无构建、零外部依赖）
-tests/                    232 项单测（unittest）
+tests/                    301 项单测（unittest）
 scripts/                  make_sample_data.py · e2e_m1.py · e2e_m2.py · e2e_m3.py ·
-                          e2e_m4.py · build_edge_bundle.py · check_docs.py ·
+                          e2e_m4.py · e2e_m5.py · build_edge_bundle.py · check_docs.py ·
                           check_annotator_ui.mjs
 ```
 

@@ -27,8 +27,9 @@
 | ✅ M1 已实现 | `/api/health`、`/api/classes`(GET/POST)、`/api/ingest/batches`(POST/GET)、`/api/ingest/upload`、`/api/ingest/batches/{id}`、`/api/images`、`/api/images/{id}/file`、`/api/tasks`、`/api/tasks/lease`、`/api/tasks/{id}`、`/api/tasks/{id}/annotations`(PUT)、`/api/tasks/{id}/adopt-candidates`、`/api/tasks/{id}/submit`、`/api/tasks/{id}/review`、`/api/datasets`(GET/POST)、`/api/datasets/{id}/freeze`、`/api/datasets/{id}/export`、`/api/runs`(仅 GET)、`/api/stats/overview`、`/api/stats/export` |
 | ✅ M2 已实现 | `/api/tasks/{id}/prelabel`、`/api/prelabel/batches`、`/api/prelabel/metrics`、`DELETE /api/annotations/{id}`（忽略候选）、`POST \| GET /api/annotations/{id}/mask`（SAM 掩膜）、`GET /api/models` |
 | ✅ M3 已实现 | `POST /api/train/runs`（异步微调）、`GET /api/train/runs/{id}`（轮询进度）、`POST /api/train/runs/{id}/cancel`、`GET /api/models/registry`、`GET /api/models/{id}`、`POST /api/models/{id}/evaluate`、`POST /api/models/{id}/validate`、`POST /api/models/{id}/promote`、`POST /api/models/{id}/export` |
+| ✅ M5 已实现 | `POST /api/active/queue`（选样并写回优先级）、`GET /api/active/queue`、`GET /api/active/alerts`、`GET /api/reports/summary?format=json|markdown`、`GET /api/reports/gis?format=geojson|csv`；`GET /api/tasks?strategy=active` 只看队列 |
 | ✅ M4 已实现（**CLI，不提供 HTTP 端点**） | 边缘离线推理走 `rdinspect infer`（目录/单图/视频/RTSP、JSONL/CSV、`--resume`、切片、性能基准），见 §8 与 [12-edge-inference](./12-edge-inference.md)；**刻意不做 REST**：边缘设备不需要 HTTP 服务与数据库 |
-| 🚧 M5 未实现（**501**） | 主动学习选样（`POST /api/active-learning/queue` 等）——所有**未注册的 POST 路径**都落到兜底路由 `POST /api/{rest:path}`，返回 501 与中立文案「`/api/{rest}` 未实现：当前版本已实现 M1–M3 端点（导入/标注/复核/预标注/训练/门禁/导出），M4（边缘推理）与 M5（主动学习）规划中；已实现端点清单见 docs/06-api-spec.md」（**不再误报**某条路径属于某个里程碑）；同一路径的 GET 返回 **405**。CLI 侧对应 `rdinspect infer`（子命令未注册，argparse 直接以退出码 2 报错） |
+| 🚧 M1 期遗留（**501/405**） | 从未实现的 `POST /api/runs`、`GET /api/runs/{id}`、`POST /api/runs/{id}/cancel`（训练走 `/api/train/runs*`）——所有**未注册的 POST 路径**都落到兜底路由 `POST /api/{rest:path}`，返回 501 与中立文案「`/api/{rest}` 未实现：当前版本已实现 M1–M3 端点（导入/标注/复核/预标注/训练/门禁/导出），M4（边缘推理）与 M5（主动学习）规划中；已实现端点清单见 docs/06-api-spec.md」（**不再误报**某条路径属于某个里程碑）；同一路径的 GET 返回 **405**。CLI 侧对应 `rdinspect infer`（子命令未注册，argparse 直接以退出码 2 报错） |
 | ⚠️ 历史设计、从未实现 | `POST /api/runs`（启动训练/评估）、`GET /api/runs/{id}`、`POST /api/runs/{id}/cancel` 是 M1 期设计，M3 起由 `/api/train/runs*` 承载。这三者仍未实现：POST 落 501 兜底（文案已中立化）、GET 落 405。`openapi.yaml` 中已标 `deprecated: true` |
 
 > 停用声明：`/api/models/{id}/promote|export` 在 M2 文档里曾被描述为「返回 501」——**已不成立**，M3 起两者都是同步实现的真实端点。
@@ -294,6 +295,11 @@ rdinspect model    list
 rdinspect model    show --id N
 rdinspect model    evaluate --id N [--split val]
 rdinspect model    validate --id N [--split val]        # 评估 + 门禁；不通过 → 退出码 5
+rdinspect active   queue --limit 100 [--strategy hybrid|uncertainty|error|diversity|random]
+                   [--package <导出包>] [--empty-weight X] [--dry-run] [--scan-limit N]
+rdinspect active   {show|alerts|compare} [--run-id N] [--threshold 2] [--baseline ID --candidate ID --labeled N]
+rdinspect report   [--days 30 --bucket day|week|month --format markdown|json|gis-geojson|gis-csv]
+                   [--classes a,b --since YYYY-MM-DD --bbox min_lon,min_lat,max_lon,max_lat --out FILE]
 rdinspect infer    --package <导出包> --input <目录|视频|rtsp://…> --out <目录>
                    [--resume|--no-resume] [--limit N] [--tile N|--no-tile] [--threads N]
                    [--conf X] [--iou X] [--imgsz N] [--fps X] [--snapshots]
@@ -314,6 +320,7 @@ rdinspect infer    --model exports/<pkg>/ --input <dir|video|rtsp://...> --out .
 `3` 依赖缺失（未安装 ML 依赖：`prelabel`、`train`，以及 `model evaluate/validate/promote/export`）；
 `4` 运行失败（训练未成功、数据集未冻结、模型不存在、未捕获的 `ConfigError`/`ValueError` 等）；
 `5` **门禁未通过**（`model validate` 门禁失败、`model promote` 被拒、`model export` 一致性验收未通过或状态冲突）；
+`5` 也用于 `active alerts` 检出连续门禁失败；
 `6` **导出包校验失败**（`infer` 拒绝启动：schema 版本/模型哈希/类别顺序/输出通道/内嵌 names 任一不匹配）——
 见 §8 与 [12-edge-inference](./12-edge-inference.md) §8。
 
@@ -351,7 +358,18 @@ rdinspect infer    --model exports/<pkg>/ --input <dir|video|rtsp://...> --out .
 `preprocess.input_size` 一致、`--expect-labels` 一致（可选）。
 导出包 `manifest.json` 自 M4 起含 `schema_version` 字段（此前缺失，是该轮的待补项，已补齐）。
 
-## 9. 契约演进策略
+## 9. 主动学习与报表（M5）
+
+- `POST /api/active/queue`：请求 `{strategy, limit, status, package_dir, margin_limit, scan_limit, conf_lo, conf_hi, margin_threshold, diversity_ratio, phash_hamming, empty_weight, include_labeled, dry_run}`；
+  响应 `{run_id, strategy, candidates, selected, updated_priorities, applied, dry_run, summary{evaluation, confusion_weights, weak_classes, class_histogram, notes}, evaluation, margin_pass, artifact}`。
+  `dry_run=true` 只算不写（不改进优先级、不落明细）。
+- `GET /api/active/queue?run_id=&limit=`：选样明细（join 任务/影像），无运行记录时 404。
+- `GET /api/active/alerts?threshold=2`：连续门禁失败告警（含"先回看标注规范"的处置建议）。
+- `GET /api/reports/summary?days=&bucket=&batch_limit=&format=`：`json` 或 `markdown`；非法 `bucket` → **400**。
+- `GET /api/reports/gis?classes=&since=&until=&bbox=&limit=&format=`：`geojson` 或 `csv`；只有带 GPS 的点会导出，`without_gps` 如实计数。
+- 契约细节与排障见 [13-active-learning](./13-active-learning.md)。
+
+## 10. 契约演进策略
 
 - 新增字段：向后兼容，客户端忽略未知字段。
 - 类别顺序变化：**不改变端点**，但会使既有导出包与新数据集不兼容 → 通过数据集新版本 + 重新导出解决（ADR-0005）。

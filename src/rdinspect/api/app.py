@@ -28,6 +28,7 @@ from ..prelabel.metrics import prelabel_metrics
 from ..prelabel.service import attach_mask_for_annotation, build_detector, prelabel_tasks
 from ..storage.db import init_db
 from ..storage.repo import Repo
+from ..active import service as active_service
 from ..train import export_onnx as export_mod
 from ..train import gate as gate_mod
 from ..train import service as train_service
@@ -156,6 +157,26 @@ class ModelExportRequest(BaseModel):
 
 class ModelEvaluateRequest(BaseModel):
     split: str | None = None
+
+
+class ActiveQueueRequest(BaseModel):
+    """主动学习选样请求（同步执行；带 package_dir 时会额外跑一遍 ONNX 取 margin 证据）。"""
+
+    strategy: str = Field(default="hybrid",
+                          pattern="^(hybrid|uncertainty|error|diversity|random)$")
+    limit: int | None = Field(default=100, ge=1, le=5000)
+    status: str = "pending"
+    package_dir: str | None = None
+    margin_limit: int | None = Field(default=None, ge=1, le=5000)
+    scan_limit: int | None = Field(default=None, ge=1, le=100000)
+    conf_lo: float | None = Field(default=None, ge=0, le=1)
+    conf_hi: float | None = Field(default=None, ge=0, le=1)
+    margin_threshold: float | None = Field(default=None, ge=0, le=1)
+    diversity_ratio: float | None = Field(default=None, ge=0, le=1)
+    phash_hamming: int | None = Field(default=None, ge=0, le=64)
+    empty_weight: float = Field(default=0.0, ge=0, le=1)
+    include_labeled: bool = False
+    dry_run: bool = False
 
 
 # ─────────────────────────── 应用工厂 ───────────────────────────
@@ -531,6 +552,80 @@ def create_app(config: Config | None = None, *, detector_factory=None,
     def list_runs(kind: str | None = None, status: str | None = None,
                   limit: int = Query(50, ge=1, le=500), repo: Repo = Depends(repo_dependency)) -> list[dict[str, Any]]:
         return repo.list_runs(kind=kind, status=status, limit=limit)
+
+    # ── 主动学习（M5，ADR-0007）──
+    @app.post("/api/active/queue")
+    def build_active_queue(payload: ActiveQueueRequest, repo: Repo = Depends(repo_dependency)) -> dict[str, Any]:
+        from ..active import scoring as active_scoring
+
+        conf_lo = payload.conf_lo if payload.conf_lo is not None else active_scoring.DEFAULT_CONF_BAND[0]
+        conf_hi = payload.conf_hi if payload.conf_hi is not None else active_scoring.DEFAULT_CONF_BAND[1]
+        try:
+            report = active_service.build_queue(
+                cfg, repo, limit=payload.limit, strategy=payload.strategy, status=payload.status,
+                conf_band=(conf_lo, conf_hi),
+                margin_threshold=(payload.margin_threshold if payload.margin_threshold is not None
+                                  else active_scoring.DEFAULT_MARGIN),
+                diversity_ratio=(payload.diversity_ratio if payload.diversity_ratio is not None
+                                 else active_scoring.DEFAULT_WEIGHTS["diversity"]),
+                phash_hamming=(payload.phash_hamming if payload.phash_hamming is not None else 6),
+                empty_weight=payload.empty_weight, package_dir=payload.package_dir,
+                margin_limit=payload.margin_limit, apply=not payload.dry_run,
+                actor="api", include_labeled=payload.include_labeled, scan_limit=payload.scan_limit)
+        except DetectorUnavailable as exc:
+            raise HTTPException(status_code=501, detail=str(exc)) from exc
+        except Exception as exc:  # noqa: BLE001
+            raise handle(exc) from exc
+        return report.as_dict(include_items=False)
+
+    @app.get("/api/active/queue")
+    def get_active_queue(run_id: int | None = None,
+                         limit: int = Query(500, ge=1, le=5000),
+                         repo: Repo = Depends(repo_dependency)) -> dict[str, Any]:
+        run = repo.get_run(run_id) if run_id is not None else repo.latest_active_run()
+        if run is None:
+            raise HTTPException(status_code=404, detail="还没有选样运行（先 POST /api/active/queue）")
+        return {"run": run, "items": repo.active_queue(run_id=int(run["id"]), limit=limit)}
+
+    @app.get("/api/active/alerts")
+    def get_active_alerts(threshold: int = Query(2, ge=1, le=10),
+                          repo: Repo = Depends(repo_dependency)) -> dict[str, Any]:
+        return active_service.gate_alerts(cfg, repo, threshold=threshold)
+
+    # ── 统计报表（M5）──
+    @app.get("/api/reports/summary")
+    def reports_summary(days: int = Query(30, ge=1, le=3650), bucket: str = Query("day"),
+                        batch_limit: int = Query(20, ge=1, le=200),
+                        format: str = Query("json"), repo: Repo = Depends(repo_dependency)) -> Any:
+        from .. import report as report_mod
+
+        try:                                   # 非法参数（如 bucket=hour）要走 400，而不是 500
+            summary = report_mod.summary(repo, days=days, bucket=bucket, batch_limit=batch_limit)
+        except Exception as exc:  # noqa: BLE001
+            raise handle(exc) from exc
+        if format == "markdown":
+            return PlainTextResponse(report_mod.render_markdown(summary), media_type="text/markdown")
+        return summary
+
+    @app.get("/api/reports/gis")
+    def reports_gis(classes: str | None = None, since: str | None = None, until: str | None = None,
+                    bbox: str | None = None, limit: int = Query(20000, ge=1, le=200000),
+                    format: str = Query("geojson"), repo: Repo = Depends(repo_dependency)) -> Any:
+        from .. import report as report_mod
+
+        from ..storage.files import utc_now
+
+        try:
+            class_codes = [item.strip() for item in classes.split(",")] if classes else None
+            box = tuple(float(part) for part in bbox.split(",")) if bbox else None
+            payload = report_mod.gis_features(repo, classes=class_codes, since=since, until=until,
+                                             limit=limit, bbox=box)  # type: ignore[arg-type]
+        except Exception as exc:  # noqa: BLE001 - 参数/日期非法 → 400
+            raise handle(exc) from exc
+        if format == "csv":
+            return PlainTextResponse(report_mod.to_gis_csv(payload), media_type="text/csv")
+        return JSONResponse(report_mod.to_geojson(
+            payload, metadata={"generated_at": utc_now(), "model": "edge/workstation export"}))
 
     # ── 训练闭环（M3）──
     @app.post("/api/train/runs", status_code=202)

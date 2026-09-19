@@ -123,3 +123,29 @@ class TestDatasets(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestExplicitImageFilter(unittest.TestCase):
+    """主动学习 A/B 对比依赖「显式指定图像集合」的选样（M5）。"""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp_path = Path(self._tmp.name)
+        self.config = make_config(self.tmp_path)
+        self.conn, self.repo = open_repo(self.config)
+        source = self.config.data_dir / "inbox" / "photos"
+        synth_images(source, count=6)
+        import_path(self.config, self.repo, source, kind="photo")
+        annotate_all(self.repo, class_code="pothole", bbox=BOX, approve=True)
+
+    def tearDown(self) -> None:
+        self.conn.close()
+        self._tmp.cleanup()
+
+    def test_image_ids_filter_limits_selection(self) -> None:
+        approved = ds.select_images(self.repo, {"review_status": "approved"})
+        self.assertEqual(len(approved), 6)
+        chosen = [row["id"] for row in approved[:2]]
+        filtered = ds.select_images(self.repo, {"review_status": "approved", "image_ids": chosen})
+        self.assertEqual(sorted(row["id"] for row in filtered), sorted(chosen))
+        self.assertEqual(ds.select_images(self.repo, {"review_status": "approved", "image_ids": []}), [])
