@@ -57,3 +57,13 @@ configs/         默认/预标注/训练/边缘 四份配置
 - 许可：内部自用，可用 ultralytics(AGPL) 与 X-AnyLabeling(GPLv3)；闭源分发路径见 ADR-0003
 
 > ⚠️ 本项目的输出用于道路养护辅助判断，**不替代人工现场核验**；不存在"零漏检"承诺。
+
+## License
+
+本项目采用 [MIT License](LICENSE)。文档中引用的第三方数据集、模型与工具遵循其各自许可（见 [docs/10-oss-survey.md](docs/10-oss-survey.md)）；
+其中 ultralytics（AGPL-3.0）与 X-AnyLabeling（GPLv3）仅在**本地训练/标注**环节使用，替换路径见 [ADR-0003](docs/adr/0003-model-choice-and-license.md)。
+
+## 状态
+
+- **M0（当前）**：架构与文档交付，自检全绿。
+- **M1 起**：采集与标注闭环 → 模型辅助标注 → 训练门禁 → 边缘离线推理（见 [docs/09-roadmap.md](docs/09-roadmap.md)）。
