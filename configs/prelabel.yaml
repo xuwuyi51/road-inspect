@@ -1,0 +1,38 @@
+# 预标注配置（模型辅助标注）
+enabled: true
+
+detector:
+  model: null                 # null = 使用 model_versions.status='production' 的检测模型
+  device: auto                # auto | cpu | cuda
+  imgsz: 640
+  conf: 0.25                  # 候选框置信度下限（低于此不生成候选）
+  iou: 0.5                    # NMS IoU
+  max_detections: 100
+
+# 切片推理（细裂缝/航拍必开，见 ADR-0006）
+tile:
+  enabled: auto               # auto = 当输入长边 > 1920 时启用
+  size: 1024
+  overlap: 0.2
+  merge_iou: 0.5
+
+# 裂缝掩膜（提示式分割，可选）
+sam:
+  enabled: false
+  model: sam2_tiny
+  prompt: box                 # box | point
+  min_box_side_px: 24         # 过小的框不生成掩膜
+  device: auto
+
+# 垃圾类零样本补充（可选）
+zeroshot:
+  enabled: false
+  model: grounding-dino-tiny
+  prompts: ["garbage", "trash", "debris", "plastic bag", "cardboard"]
+  box_threshold: 0.3
+  text_threshold: 0.25
+
+# 候选降级策略：预标注失败不得阻塞人工流程
+fallback:
+  on_error: disable           # disable = 该图转纯人工；retry = 重试一次
+  timeout_seconds: 120

@@ -1,0 +1,39 @@
+# 边缘离线推理配置（随导出包分发，边缘端只读）
+model:
+  package_dir: ./exports/yolo11s-road-2026.09.12-a   # 含 model.onnx/labels.yaml/preprocess.json/manifest.json
+  device: cpu                 # cpu | cuda | tensorrt
+  precision: fp16             # fp32 | fp16 | int8（int8 需在冻结验证集复测）
+
+runtime:
+  threads: 4
+  warmup_runs: 3
+
+inference:
+  imgsz: 640
+  conf: 0.25
+  iou: 0.5
+  max_detections: 100
+  tile:
+    enabled: true
+    size: 1024
+    overlap: 0.2
+    merge_iou: 0.5
+
+input:
+  image_exts: [".jpg", ".jpeg", ".png", ".bmp", ".webp"]
+  video_fps: 2                # 视频输入时的抽帧频率（无 ffmpeg 时依赖内置解码）
+  rtsp_timeout_seconds: 10
+
+output:
+  jsonl: results.jsonl
+  csv: results.csv
+  save_hit_snapshots: false   # 命中时保存带框截图（占空间，默认关闭）
+  snapshot_dir: ./out/snaps
+
+resume:
+  enabled: true               # 记录已处理文件哈希，重复运行跳过
+  state_file: .infer-state.json
+
+limits:
+  max_image_side: 8192        # 超过则先降采样，防止内存爆
+  min_free_disk_mb: 500       # 低于阈值停止并告警

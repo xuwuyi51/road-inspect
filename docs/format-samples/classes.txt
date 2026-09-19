@@ -1,0 +1,5 @@
+longitudinal_crack
+transverse_crack
+pothole
+garbage
+alligator_crack

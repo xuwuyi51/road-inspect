@@ -1,0 +1,969 @@
+openapi: 3.1.0
+info:
+  title: road-inspect API
+  version: 1.0.0
+  description: |
+    轻量级道路灾害巡查程序（横向裂缝 / 纵向裂缝 / 坑洞 / 垃圾，可扩展）的工作站 REST 契约。
+    首版服务仅监听本机（默认 127.0.0.1:8787），无账号体系；所有时间为 UTC ISO8601 文本。
+    训练/预标注/导出等耗时操作统一返回 `run` 资源，客户端轮询或订阅日志。
+servers:
+  - url: http://127.0.0.1:8787
+    description: 本机工作站（默认）
+tags:
+  - name: health
+  - name: classes
+  - name: ingest
+  - name: images
+  - name: tasks
+  - name: annotations
+  - name: prelabel
+  - name: reviews
+  - name: datasets
+  - name: runs
+  - name: models
+  - name: stats
+
+paths:
+  /api/health:
+    get:
+      tags: [health]
+      summary: 健康检查与版本信息
+      responses:
+        "200":
+          description: 服务状态
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, schema_version, providers]
+                properties:
+                  status: { type: string, enum: [ok, degraded] }
+                  schema_version: { type: integer }
+                  providers:
+                    type: object
+                    properties:
+                      detector: { type: [string, "null"], description: 现役检测模型名 }
+                      sam: { type: [string, "null"] }
+                      gpu: { type: [string, "null"], description: 形如 "RTX 5060 Ti 15.5GB" }
+
+  /api/classes:
+    get:
+      tags: [classes]
+      summary: 类别注册表（驱动标注台与导出）
+      responses:
+        "200":
+          description: 类别列表
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Class" }
+    post:
+      tags: [classes]
+      summary: 注册新类别（扩展点）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code, name_zh, name_en]
+              properties:
+                code: { type: string, pattern: "^[a-z][a-z0-9_]{2,31}$" }
+                name_zh: { type: string }
+                name_en: { type: string }
+                color: { type: string, pattern: "^#[0-9a-fA-F]{6}$" }
+                parent_code: { type: [string, "null"] }
+                is_crack: { type: boolean, default: false }
+                order_index: { type: integer, default: 100 }
+      responses:
+        "201":
+          description: 已创建
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Class" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /api/ingest/batches:
+    post:
+      tags: [ingest]
+      summary: 创建导入批次（上传文件或登记服务器目录）
+      description: |
+        支持两种模式：`multipart/form-data` 直传文件；或 `application/json` 传服务器可读目录路径。
+        导入是异步的：返回 `run` 与批次 ID，客户端轮询进度。
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [kind]
+              properties:
+                kind: { type: string, enum: [photo, video, aerial, external] }
+                files:
+                  type: array
+                  items: { type: string, format: binary }
+                note: { type: string }
+          application/json:
+            schema:
+              type: object
+              required: [kind, source_dir]
+              properties:
+                kind: { type: string, enum: [photo, video, aerial, external] }
+                source_dir: { type: string, description: 服务器上的目录绝对路径 }
+                note: { type: string }
+                options:
+                  $ref: "#/components/schemas/IngestOptions"
+      responses:
+        "202":
+          description: 已接受（异步）
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [batch_id, run_id]
+                properties:
+                  batch_id: { type: integer }
+                  run_id: { type: integer }
+    get:
+      tags: [ingest]
+      summary: 批次列表
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          description: 批次分页
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/Batch" }
+                  next_cursor: { type: [string, "null"] }
+
+  /api/ingest/batches/{batchId}:
+    get:
+      tags: [ingest]
+      summary: 批次详情与导入结果统计
+      parameters:
+        - $ref: "#/components/parameters/BatchId"
+      responses:
+        "200":
+          description: 批次详情
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Batch"
+                  - type: object
+                    properties:
+                      outcome_counts:
+                        type: object
+                        additionalProperties: { type: integer }
+                      failures:
+                        type: array
+                        items: { $ref: "#/components/schemas/IngestItem" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/images:
+    get:
+      tags: [images]
+      summary: 影像查询（标注/复核/统计共用）
+      parameters:
+        - name: batch_id
+          in: query
+          schema: { type: integer }
+        - name: source_kind
+          in: query
+          schema: { type: string, enum: [photo, video_frame, aerial, aerial_tile, external] }
+        - name: captured_from
+          in: query
+          schema: { type: string, format: date-time }
+        - name: captured_to
+          in: query
+          schema: { type: string, format: date-time }
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          description: 影像分页
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/Image" }
+                  next_cursor: { type: [string, "null"] }
+
+  /api/images/{imageId}/file:
+    get:
+      tags: [images]
+      summary: 原始影像（支持 ?thumb=1 返回长边 512 缩略图）
+      parameters:
+        - $ref: "#/components/parameters/ImageId"
+        - name: thumb
+          in: query
+          schema: { type: boolean, default: false }
+      responses:
+        "200":
+          description: 影像字节流
+          content:
+            image/jpeg: { schema: { type: string, format: binary } }
+            image/png: { schema: { type: string, format: binary } }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/tasks:
+    get:
+      tags: [tasks]
+      summary: 任务队列（标注台/复核台取任务）
+      parameters:
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [pending, prelabeling, prelabeled, annotating, annotated, reviewing, approved, rejected, skipped]
+        - name: batch_id
+          in: query
+          schema: { type: integer }
+        - name: class_code
+          in: query
+          schema: { type: string }
+        - name: strategy
+          in: query
+          description: 排序策略；low_conf 用于主动学习优先队列
+          schema: { type: string, enum: [fifo, priority, low_conf, random], default: fifo }
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          description: 任务分页
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/Task" }
+                  next_cursor: { type: [string, "null"] }
+
+  /api/tasks/lease:
+    post:
+      tags: [tasks]
+      summary: 批量领取任务（写租约，防重复领取）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [count]
+              properties:
+                count: { type: integer, minimum: 1, maximum: 200 }
+                status: { type: string, default: pending }
+                assignee: { type: string }
+                lease_seconds: { type: integer, default: 1800 }
+      responses:
+        "200":
+          description: 领取结果（可能少于请求数）
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  leased:
+                    type: array
+                    items: { $ref: "#/components/schemas/Task" }
+
+  /api/tasks/{taskId}:
+    get:
+      tags: [tasks]
+      summary: 任务详情（含影像、标注、预标注候选）
+      parameters:
+        - $ref: "#/components/parameters/TaskId"
+      responses:
+        "200":
+          description: 任务详情
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Task"
+                  - type: object
+                    properties:
+                      image: { $ref: "#/components/schemas/Image" }
+                      annotations:
+                        type: array
+                        items: { $ref: "#/components/schemas/Annotation" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/tasks/{taskId}/annotations:
+    put:
+      tags: [annotations]
+      summary: 全量提交标注（覆盖式；服务端做 diff 并写审计）
+      description: |
+        幂等：带 `Idempotency-Key` 时同键重复提交返回首次结果。
+        标注 `source` 由服务端依据是否来自预标注推导，客户端可不传。
+      parameters:
+        - $ref: "#/components/parameters/TaskId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [annotations]
+              properties:
+                annotations:
+                  type: array
+                  items: { $ref: "#/components/schemas/AnnotationInput" }
+      responses:
+        "200":
+          description: 保存后的标注
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  annotations:
+                    type: array
+                    items: { $ref: "#/components/schemas/Annotation" }
+                  changed: { type: integer }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /api/tasks/{taskId}/submit:
+    post:
+      tags: [tasks]
+      summary: 提交任务进入复核
+      parameters:
+        - $ref: "#/components/parameters/TaskId"
+      responses:
+        "200":
+          description: 更新后的任务
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Task" }
+
+  /api/tasks/{taskId}/prelabel:
+    post:
+      tags: [prelabel]
+      summary: 对单个任务执行预标注
+      parameters:
+        - $ref: "#/components/parameters/TaskId"
+      requestBody:
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PrelabelOptions" }
+      responses:
+        "202":
+          description: 已排入（返回运行记录）
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Run" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+
+  /api/prelabel/batches:
+    post:
+      tags: [prelabel]
+      summary: 批量预标注（按条件选任务）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                limit: { type: integer, default: 200 }
+                batch_id: { type: integer }
+                status: { type: string, default: pending }
+                options: { $ref: "#/components/schemas/PrelabelOptions" }
+      responses:
+        "202":
+          description: 已排入
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Run" }
+
+  /api/tasks/{taskId}/review:
+    post:
+      tags: [reviews]
+      summary: 复核决定（通过或打回）
+      parameters:
+        - $ref: "#/components/parameters/TaskId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [decision]
+              properties:
+                decision: { type: string, enum: [approve, reject] }
+                reason_code:
+                  type: string
+                  enum: [missing, wrong_class, loose_box, tight_box, mask_bad, other]
+                note: { type: string }
+                reviewer: { type: string }
+      responses:
+        "200":
+          description: 任务与复核记录
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  task: { $ref: "#/components/schemas/Task" }
+                  review: { $ref: "#/components/schemas/Review" }
+
+  /api/datasets:
+    get:
+      tags: [datasets]
+      summary: 数据集版本列表
+      responses:
+        "200":
+          description: 列表
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/DatasetVersion" }
+    post:
+      tags: [datasets]
+      summary: 创建数据集草稿（按条件选样，可回放）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string, pattern: "^ds-[0-9a-zA-Z._-]{3,40}$" }
+                filter:
+                  type: object
+                  properties:
+                    class_codes: { type: array, items: { type: string } }
+                    batch_ids: { type: array, items: { type: integer } }
+                    captured_from: { type: string, format: date-time }
+                    captured_to: { type: string, format: date-time }
+                    review_status: { type: string, enum: [approved, annotated, any], default: approved }
+                split:
+                  type: object
+                  properties:
+                    train: { type: number, default: 0.7 }
+                    val: { type: number, default: 0.15 }
+                    test: { type: number, default: 0.15 }
+                    seed: { type: integer, default: 42 }
+                    group_by: { type: string, enum: [road_segment, gps_grid, none], default: gps_grid }
+      responses:
+        "201":
+          description: 草稿已创建
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DatasetVersion" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /api/datasets/{datasetId}/freeze:
+    post:
+      tags: [datasets]
+      summary: 冻结数据集（写清单哈希，之后不可变）
+      parameters:
+        - $ref: "#/components/parameters/DatasetId"
+      responses:
+        "200":
+          description: 冻结后的数据集
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DatasetVersion" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /api/datasets/{datasetId}/export:
+    post:
+      tags: [datasets]
+      summary: 导出数据集为 YOLO / COCO / LabelMe
+      parameters:
+        - $ref: "#/components/parameters/DatasetId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [format]
+              properties:
+                format: { type: string, enum: [yolo, coco, labelme] }
+                out_dir: { type: string, description: 留空则写 data/datasets/<name>/exports/ }
+      responses:
+        "202":
+          description: 已排入导出
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Run" }
+
+  /api/runs:
+    get:
+      tags: [runs]
+      summary: 运行记录（导入/预标注/训练/评估/导出）
+      parameters:
+        - name: kind
+          in: query
+          schema: { type: string, enum: [ingest, prelabel, train, evaluate, export] }
+        - name: status
+          in: query
+          schema: { type: string, enum: [queued, running, succeeded, failed, canceled] }
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200":
+          description: 运行列表
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Run" }
+    post:
+      tags: [runs]
+      summary: 启动训练或评估
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [kind, dataset_id]
+              properties:
+                kind: { type: string, enum: [train, evaluate] }
+                dataset_id: { type: integer }
+                config:
+                  type: object
+                  properties:
+                    model: { type: string, default: yolo11s.pt }
+                    imgsz: { type: integer, default: 640 }
+                    epochs: { type: integer, default: 100 }
+                    batch: { type: integer, default: 16 }
+                    seed: { type: integer, default: 42 }
+                    flipud: { type: boolean, default: false, description: 必须为 false（横/纵语义） }
+                    lr0: { type: number, default: 0.001 }
+                    resume_from: { type: [string, "null"], description: 从既有权重继续（域适配微调） }
+      responses:
+        "202":
+          description: 已排入
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Run" }
+
+  /api/runs/{runId}:
+    get:
+      tags: [runs]
+      summary: 运行详情（含指标/日志尾部）
+      parameters:
+        - $ref: "#/components/parameters/RunId"
+        - name: log_tail
+          in: query
+          schema: { type: integer, default: 200 }
+      responses:
+        "200":
+          description: 运行详情
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Run"
+                  - type: object
+                    properties:
+                      log_tail:
+                        type: array
+                        items: { type: string }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/runs/{runId}/cancel:
+    post:
+      tags: [runs]
+      summary: 取消运行（训练/预标注）
+      parameters:
+        - $ref: "#/components/parameters/RunId"
+      responses:
+        "200":
+          description: 已请求取消
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Run" }
+
+  /api/models:
+    get:
+      tags: [models]
+      summary: 模型注册表
+      parameters:
+        - name: status
+          in: query
+          schema: { type: string, enum: [candidate, validated, production, archived] }
+        - name: task
+          in: query
+          schema: { type: string, enum: [detection, segmentation, zeroshot] }
+      responses:
+        "200":
+          description: 模型列表
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/ModelVersion" }
+
+  /api/models/{modelId}/promote:
+    post:
+      tags: [models]
+      summary: 晋级模型（candidate → validated → production），门禁不通过时返回 409
+      parameters:
+        - $ref: "#/components/parameters/ModelId"
+      responses:
+        "200":
+          description: 晋级后模型
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ModelVersion" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /api/models/{modelId}/export:
+    post:
+      tags: [models]
+      summary: 导出边缘包（ONNX + labels + preprocess + manifest）
+      parameters:
+        - $ref: "#/components/parameters/ModelId"
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                opset: { type: integer, default: 17 }
+                dynamic_batch: { type: boolean, default: true }
+      responses:
+        "202":
+          description: 已排入导出
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Run" }
+
+  /api/stats/overview:
+    get:
+      tags: [stats]
+      summary: 统计概览（类别分布、批次进度、标注效率、模型指标）
+      parameters:
+        - name: batch_id
+          in: query
+          schema: { type: integer }
+        - name: from
+          in: query
+          schema: { type: string, format: date-time }
+        - name: to
+          in: query
+          schema: { type: string, format: date-time }
+      responses:
+        "200":
+          description: 统计结果
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StatsOverview" }
+
+  /api/stats/export:
+    get:
+      tags: [stats]
+      summary: 导出统计明细（CSV/JSON，含经纬度与路段号）
+      parameters:
+        - name: format
+          in: query
+          schema: { type: string, enum: [csv, json], default: csv }
+      responses:
+        "200":
+          description: 文件字节流
+          content:
+            text/csv: { schema: { type: string, format: binary } }
+            application/json: { schema: { type: object } }
+
+components:
+  parameters:
+    Limit:
+      name: limit
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 500, default: 50 }
+    Cursor:
+      name: cursor
+      in: query
+      schema: { type: [string, "null"] }
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      schema: { type: string, maxLength: 128 }
+    BatchId:
+      name: batchId
+      in: path
+      required: true
+      schema: { type: integer }
+    ImageId:
+      name: imageId
+      in: path
+      required: true
+      schema: { type: integer }
+    TaskId:
+      name: taskId
+      in: path
+      required: true
+      schema: { type: integer }
+    DatasetId:
+      name: datasetId
+      in: path
+      required: true
+      schema: { type: integer }
+    RunId:
+      name: runId
+      in: path
+      required: true
+      schema: { type: integer }
+    ModelId:
+      name: modelId
+      in: path
+      required: true
+      schema: { type: integer }
+
+  responses:
+    NotFound:
+      description: 资源不存在
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Conflict:
+      description: 冲突（重名/状态不允许/门禁未通过）
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Unavailable:
+      description: 依赖服务不可用（如模型未加载、预标注被关闭）
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+
+  schemas:
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code: { type: string, description: 机器可读错误码，如 dataset_name_taken }
+        message: { type: string }
+        details: { type: object, additionalProperties: true }
+
+    Class:
+      type: object
+      required: [code, name_zh, name_en, order_index, active]
+      properties:
+        code: { type: string }
+        name_zh: { type: string }
+        name_en: { type: string }
+        color: { type: string }
+        parent_code: { type: [string, "null"] }
+        is_crack: { type: boolean }
+        order_index: { type: integer }
+        active: { type: boolean }
+
+    Geo:
+      type: object
+      properties:
+        lat: { type: [number, "null"] }
+        lon: { type: [number, "null"] }
+        source: { type: string, enum: [exif, track, manual, none] }
+
+    IngestOptions:
+      type: object
+      properties:
+        video_fps: { type: number, default: 2, description: 视频抽帧频率 }
+        max_frames_per_video: { type: integer, default: 2000 }
+        dedup_threshold: { type: integer, default: 6, description: pHash 汉明距离阈值 }
+        tile:
+          type: object
+          properties:
+            enabled: { type: boolean, default: false }
+            size: { type: integer, default: 1024 }
+            overlap: { type: number, default: 0.2 }
+        track_csv: { type: [string, "null"], description: 车载 GPS 轨迹文件（CSV/SRT），按时间对齐 }
+
+    IngestItem:
+      type: object
+      properties:
+        source_path: { type: string }
+        outcome: { type: string, enum: [added, dup_sha, dup_phash, skipped_type, skipped_size, error] }
+        reason: { type: [string, "null"] }
+        image_id: { type: [integer, "null"] }
+
+    Batch:
+      type: object
+      required: [id, kind, created_at]
+      properties:
+        id: { type: integer }
+        kind: { type: string, enum: [photo, video, aerial, external] }
+        source: { type: [string, "null"] }
+        note: { type: [string, "null"] }
+        stats:
+          type: object
+          additionalProperties: { type: integer }
+        created_at: { type: string, format: date-time }
+
+    Image:
+      type: object
+      required: [id, path, width, height, source_kind]
+      properties:
+        id: { type: integer }
+        path: { type: string }
+        width: { type: integer }
+        height: { type: integer }
+        source_kind: { type: string, enum: [photo, video_frame, aerial, aerial_tile, external] }
+        parent_image_id: { type: [integer, "null"] }
+        tile: { type: [object, "null"] }
+        captured_at: { type: [string, "null"], format: date-time }
+        geo: { $ref: "#/components/schemas/Geo" }
+        duplicate_of: { type: [integer, "null"] }
+        thumb_url: { type: string }
+
+    AnnotationInput:
+      type: object
+      required: [class_code, kind]
+      properties:
+        id: { type: [integer, "null"], description: 已有标注传入 id 表示更新 }
+        class_code: { type: string }
+        kind: { type: string, enum: [bbox, polygon, mask] }
+        bbox: { $ref: "#/components/schemas/BBox" }
+        polygon: { type: array, items: { type: number }, description: "扁平坐标序列 [x1,y1,x2,y2,...]，归一化" }
+        mask_base64_png: { type: [string, "null"], description: 掩膜 PNG base64（仅 kind=mask） }
+        difficult: { type: boolean, default: false }
+
+    BBox:
+      type: object
+      required: [x1, y1, x2, y2]
+      properties:
+        x1: { type: number, minimum: 0, maximum: 1 }
+        y1: { type: number, minimum: 0, maximum: 1 }
+        x2: { type: number, minimum: 0, maximum: 1 }
+        y2: { type: number, minimum: 0, maximum: 1 }
+
+    Annotation:
+      allOf:
+        - $ref: "#/components/schemas/AnnotationInput"
+        - type: object
+          properties:
+            id: { type: integer }
+            image_id: { type: integer }
+            task_id: { type: integer }
+            score: { type: [number, "null"] }
+            source: { type: string, enum: [human, model, model_edited, external] }
+            model_version_id: { type: [integer, "null"] }
+            created_at: { type: string, format: date-time }
+            updated_at: { type: string, format: date-time }
+
+    Review:
+      type: object
+      properties:
+        id: { type: integer }
+        task_id: { type: integer }
+        reviewer: { type: [string, "null"] }
+        decision: { type: string, enum: [approve, reject] }
+        reason_code: { type: [string, "null"] }
+        note: { type: [string, "null"] }
+        created_at: { type: string, format: date-time }
+
+    Task:
+      type: object
+      required: [id, image_id, status]
+      properties:
+        id: { type: integer }
+        image_id: { type: integer }
+        status:
+          type: string
+          enum: [pending, prelabeling, prelabeled, annotating, annotated, reviewing, approved, rejected, skipped]
+        priority: { type: integer }
+        assignee: { type: [string, "null"] }
+        lease_until: { type: [string, "null"], format: date-time }
+        prelabel_state: { type: string, enum: [none, queued, done, failed] }
+        attempts: { type: integer }
+
+    PrelabelOptions:
+      type: object
+      properties:
+        detector: { type: [string, "null"], description: 指定模型名/版本，默认现役 production }
+        conf: { type: number, default: 0.25 }
+        iou: { type: number, default: 0.5 }
+        enable_sam: { type: boolean, default: false, description: 为裂缝框生成掩膜候选 }
+        enable_zeroshot: { type: boolean, default: false, description: 垃圾类零样本补充 }
+        tile: { type: object, description: 切片参数，默认沿用 ingest 配置 }
+
+    DatasetVersion:
+      type: object
+      required: [id, name, status]
+      properties:
+        id: { type: integer }
+        name: { type: string }
+        status: { type: string, enum: [draft, frozen, archived] }
+        filter: { type: object }
+        class_order: { type: [array, "null"], items: { type: string } }
+        split: { type: [object, "null"] }
+        stats: { type: [object, "null"] }
+        manifest_hash: { type: [string, "null"] }
+        root_path: { type: [string, "null"] }
+        frozen_at: { type: [string, "null"], format: date-time }
+        created_at: { type: string, format: date-time }
+
+    Run:
+      type: object
+      required: [id, kind, status]
+      properties:
+        id: { type: integer }
+        kind: { type: string, enum: [ingest, prelabel, train, evaluate, export] }
+        status: { type: string, enum: [queued, running, succeeded, failed, canceled] }
+        run_key: { type: [string, "null"] }
+        config: { type: object }
+        dataset_id: { type: [integer, "null"] }
+        model_id: { type: [integer, "null"] }
+        metrics: { type: [object, "null"] }
+        error: { type: [string, "null"] }
+        started_at: { type: [string, "null"], format: date-time }
+        finished_at: { type: [string, "null"], format: date-time }
+
+    ModelVersion:
+      type: object
+      required: [id, name, version, status, task]
+      properties:
+        id: { type: integer }
+        name: { type: string }
+        version: { type: string }
+        task: { type: string, enum: [detection, segmentation, zeroshot] }
+        status: { type: string, enum: [candidate, validated, production, archived] }
+        dataset_id: { type: [integer, "null"] }
+        metrics: { type: [object, "null"] }
+        gate: { type: [object, "null"] }
+        labels: { type: [object, "null"] }
+        sha256: { type: [string, "null"] }
+        created_at: { type: string, format: date-time }
+
+    StatsOverview:
+      type: object
+      properties:
+        class_counts:
+          type: array
+          items:
+            type: object
+            properties:
+              class_code: { type: string }
+              name_zh: { type: string }
+              n: { type: integer }
+        task_progress:
+          type: object
+          additionalProperties: { type: integer }
+        annotation_throughput:
+          type: object
+          properties:
+            images_per_hour: { type: number }
+            avg_seconds_per_image: { type: number }
+        model_metrics:
+          type: [object, "null"]

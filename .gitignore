@@ -1,0 +1,39 @@
+# 运行期数据（严禁入库）
+data/
+logs/
+exports/
+snapshots/
+*.db
+*.db-wal
+*.db-shm
+.infer-state.json
+results.jsonl
+results.csv
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 前端
+node_modules/
+web/dist/
+.vite/
+
+# 模型与数据文件（大文件不进 git）
+*.pt
+*.onnx
+*.engine
+*.safetensors
+*.tar.gz
+
+# 编辑器/系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

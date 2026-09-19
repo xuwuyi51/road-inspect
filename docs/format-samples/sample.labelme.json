@@ -1,0 +1,44 @@
+{
+  "version": "5.4.1",
+  "flags": {},
+  "shapes": [
+    {
+      "label": "transverse_crack",
+      "points": [[192.0, 216.0], [864.0, 280.8]],
+      "group_id": null,
+      "description": null,
+      "shape_type": "rectangle",
+      "flags": { "source": "model", "score": 0.71 }
+    },
+    {
+      "label": "longitudinal_crack",
+      "points": [[1152.0, 108.0], [1267.2, 594.0]],
+      "group_id": null,
+      "description": null,
+      "shape_type": "rectangle",
+      "flags": { "source": "model_edited", "score": 0.66 }
+    },
+    {
+      "label": "pothole",
+      "points": [[1344.0, 648.0], [1689.6, 842.4]],
+      "group_id": null,
+      "description": null,
+      "shape_type": "rectangle",
+      "flags": { "source": "human" }
+    },
+    {
+      "label": "garbage",
+      "points": [[384.0, 702.0], [729.6, 918.0]],
+      "group_id": null,
+      "description": null,
+      "shape_type": "rectangle",
+      "flags": { "source": "human", "difficult": true }
+    }
+  ],
+  "imagePath": "raw/20260912/3f2a1c0d9e7b.jpg",
+  "imageData": null,
+  "imageWidth": 1920,
+  "imageHeight": 1080,
+  "capturedAt": "2026-09-12T02:13:05Z",
+  "gps": { "lat": 31.2304, "lon": 121.4737, "source": "exif" }
+}

@@ -1,0 +1,50 @@
+# road-inspect 默认配置（实现阶段由 src/rdinspect/config.py 读取并校验）
+server:
+  host: 127.0.0.1          # 仅本机；放开局域网需同时配置反代鉴权（见 08-deployment §4）
+  port: 8787
+  workers: 1               # 单写者模型（SQLite）
+
+paths:
+  data_dir: /var/lib/road-inspect/data     # app.db 与文件根；可迁移到外接盘
+  logs_dir: /var/lib/road-inspect/logs
+  allowed_roots:                            # 允许登记为导入源的服务器目录（白名单）
+    - /var/lib/road-inspect/data/inbox
+  thumb_long_edge: 512
+
+ingest:
+  dedup:
+    phash_hamming_threshold: 6              # ≤ 该值视为近似重复
+    keep_near_duplicates: true              # 仍入库但降优先级（避免漏检）
+  video:
+    default_fps: 2
+    max_frames_per_video: 2000
+  tile:
+    enabled: false                          # 航拍默认开启（按批次覆盖）
+    size: 1024
+    overlap: 0.2
+  limits:
+    max_file_mb: 50
+    max_batch_gb: 2
+
+tasks:
+  lease_seconds: 1800
+  auto_submit_after_prelabel: false          # 预标注仅作候选，必须人工确认
+
+review:
+  default_sample_ratio: 0.2
+  new_annotator_first_n: 50                  # 新标注员前 N 张全检
+  kappa_alert_threshold: 0.7
+  freeze_requirements:
+    approved_ratio: 0.95
+    min_boxes_per_class: 200
+    no_pending_rejects: true
+
+storage:
+  sqlite:
+    journal_mode: WAL
+    synchronous: NORMAL
+    busy_timeout_ms: 5000
+
+logging:
+  level: info
+  rotate_days: 7

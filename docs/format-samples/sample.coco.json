@@ -1,0 +1,64 @@
+{
+  "info": {
+    "description": "road-inspect format sample (COCO)",
+    "version": "1.0",
+    "date_created": "2026-09-12T00:00:00Z"
+  },
+  "licenses": [],
+  "images": [
+    {
+      "id": 1,
+      "file_name": "raw/20260912/3f2a1c0d9e7b.jpg",
+      "width": 1920,
+      "height": 1080,
+      "date_captured": "2026-09-12T02:13:05Z",
+      "gps_lat": 31.2304,
+      "gps_lon": 121.4737
+    }
+  ],
+  "categories": [
+    { "id": 1, "name": "longitudinal_crack", "supercategory": "crack" },
+    { "id": 2, "name": "transverse_crack", "supercategory": "crack" },
+    { "id": 3, "name": "pothole", "supercategory": "defect" },
+    { "id": 4, "name": "garbage", "supercategory": "object" },
+    { "id": 5, "name": "alligator_crack", "supercategory": "crack" }
+  ],
+  "annotations": [
+    {
+      "id": 1,
+      "image_id": 1,
+      "category_id": 2,
+      "bbox": [192.0, 216.0, 672.0, 64.8],
+      "area": 43545.6,
+      "iscrowd": 0,
+      "attributes": { "source": "model", "score": 0.71, "difficult": false }
+    },
+    {
+      "id": 2,
+      "image_id": 1,
+      "category_id": 1,
+      "bbox": [1152.0, 108.0, 115.2, 486.0],
+      "area": 55987.2,
+      "iscrowd": 0,
+      "attributes": { "source": "model_edited", "score": 0.66, "difficult": false }
+    },
+    {
+      "id": 3,
+      "image_id": 1,
+      "category_id": 3,
+      "bbox": [1344.0, 648.0, 345.6, 194.4],
+      "area": 67184.64,
+      "iscrowd": 0,
+      "attributes": { "source": "human", "score": null, "difficult": false }
+    },
+    {
+      "id": 4,
+      "image_id": 1,
+      "category_id": 4,
+      "bbox": [384.0, 702.0, 345.6, 216.0],
+      "area": 74649.6,
+      "iscrowd": 0,
+      "attributes": { "source": "human", "score": null, "difficult": true }
+    }
+  ]
+}

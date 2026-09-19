@@ -1,0 +1,56 @@
+# 训练配置（小样本首版；由 rdinspect train 读取）
+dataset:
+  name: ds-2026w38            # 必须为 frozen 状态
+
+model:
+  arch: yolo11s.pt            # 边缘导出可用 yolo11n.pt（见 08-deployment §2.1）
+  pretrained: true
+  resume_from: null           # 域适配微调时填上一版权重路径
+
+train:
+  imgsz: 640
+  epochs: 100
+  patience: 20                # 早停
+  batch: 16
+  workers: 4                  # 内存 15GB 约束下不超过 4
+  seed: 42
+  optimizer: AdamW
+  lr0: 0.001
+  lrf: 0.01
+  warmup_epochs: 3
+  cos_lr: true
+
+augment:
+  mosaic: 1.0
+  mixup: 0.1
+  copy_paste: 0.1             # 垃圾类样本少时提升
+  degrees: 10.0
+  translate: 0.1
+  scale: 0.5
+  hsv_h: 0.015
+  hsv_s: 0.7
+  hsv_v: 0.4
+  fliplr: 0.5
+  flipud: 0.0                 # ⚠️ 必须为 0：垂直翻转会交换"横向/纵向"语义
+  erasing: 0.2
+
+evaluate:
+  splits: [val, test]
+  report:
+    - per_class_metrics       # P/R/mAP50/mAP50-95
+    - confusion_matrix
+    - size_bucket_recall      # small/medium/large
+    - sahi_ablation           # 切片开关对比
+  export_failures: 20         # 导出失败样例数
+
+gate:
+  baseline: production        # 对比对象
+  map50_tolerance: 0.005
+  per_class_tolerance: 0.02   # 任一类下降不得超过（防类别塌陷）
+
+export:
+  onnx:
+    opset: 17
+    dynamic_batch: true
+    simplify: true
+    half: false               # 边缘端按设备选择 FP16
