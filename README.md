@@ -65,5 +65,70 @@ configs/         默认/预标注/训练/边缘 四份配置
 
 ## 状态
 
-- **M0（当前）**：架构与文档交付，自检全绿。
-- **M1 起**：采集与标注闭环 → 模型辅助标注 → 训练门禁 → 边缘离线推理（见 [docs/09-roadmap.md](docs/09-roadmap.md)）。
+- **M0 ✅**：架构与文档交付，文档自检全绿。
+- **M1 ✅（当前）**：采集与标注闭环可运行——导入（照片/视频抽帧/航拍切片、SHA256+pHash 去重、EXIF/GPS）、Web 标注台（框选/快捷键/草稿/亮度对比度）、任务租约、标注全量提交（差异+审计）、复核、数据集草稿/冻结（清单哈希）、三格式导出与往返校验。
+- **M2 起**：模型辅助标注（YOLO 预标注 + SAM 掩膜）→ 训练与权重门禁 → 边缘离线推理（见 [docs/09-roadmap.md](docs/09-roadmap.md)）。
+
+## 快速开始（M1）
+
+```bash
+# 1) 安装（Python 3.11+；不污染其他项目环境）
+python3 -m venv .venv && .venv/bin/pip install -e .
+# 国内网络可用镜像：-i https://pypi.tuna.tsinghua.edu.cn/simple
+
+# 2) 启动工作站（默认 127.0.0.1:8787，标注台在 /，API 在 /api）
+.venv/bin/rdinspect serve
+
+# 3) 导入素材（目录必须在 configs/default.yaml 的 paths.allowed_roots 白名单内）
+.venv/bin/rdinspect import --kind photo --input ./data/inbox/photos
+.venv/bin/rdinspect import --kind video --input ./data/inbox/patrol.mp4 --fps 2
+.venv/bin/rdinspect import --kind aerial --input ./data/inbox/aerial --tile   # 航拍切片
+
+# 4) 浏览器打开 http://127.0.0.1:8787 标注 →「保存并提交」；复核走 /api/tasks/{id}/review
+
+# 5) 数据集：草稿 → 冻结 → 导出
+.venv/bin/rdinspect dataset create --name ds-2026w38 --review-status approved
+.venv/bin/rdinspect dataset freeze --name ds-2026w38
+.venv/bin/rdinspect export --name ds-2026w38 --formats yolo,coco,labelme
+
+# 6) 统计与自检
+.venv/bin/rdinspect stats --export csv
+.venv/bin/rdinspect check
+```
+
+无真实素材时可生成合成数据做回归（M1 验收即用此方式）：
+
+```bash
+python3 scripts/make_sample_data.py --out /tmp/rd-sample --count 500   # 500 张 + 1 段视频
+python3 scripts/e2e_m1.py --photos 500 --per-class 50                  # 端到端验收
+```
+
+## 测试
+
+```bash
+PYTHONPATH=src:tests .venv/bin/python -m unittest discover -s tests -t .   # 44 项单测
+python3 scripts/check_docs.py                                              # 文档/DDL/OpenAPI/样例自检
+python3 scripts/e2e_m1.py                                                  # 端到端验收（合成素材）
+```
+
+| 测试层 | 覆盖 | 结果 |
+|---|---|---|
+| 单测（44 项） | 几何换算、pHash 去重、EXIF/质量指标、导入幂等、任务租约、标注差异+审计、复核状态机、数据集划分/冻结/哈希稳定、三格式往返、HTTP 契约（含 400/404/409/501 语义） | 全部通过 |
+| 端到端 | 500 张合成照片 + 1 段视频 → 导入 → 四类各 50 张标注复核 → 冻结导出 → 往返零误差 → 哈希可复现 | 通过 |
+
+## 目录结构（M1 实现）
+
+```
+src/rdinspect/
+├── config.py            配置加载 + allowed_roots 路径白名单
+├── cli.py               serve / import / tasks / dataset / export / stats / thumbs / check
+├── errors.py            领域异常（映射 404/409）
+├── storage/{db,files,repo}.py     SQLite(WAL)+迁移、文件原子写/缩略图、仓储与审计
+├── core/                 hashing(pHash) · geometry(坐标) · images(EXIF/质量/切片) ·
+│                         ingest(导入去重) · formats(YOLO/COCO/LabelMe) · datasets(划分/冻结)
+└── api/                  FastAPI 应用 + 静态标注台（单文件、无构建、零外部依赖）
+tests/                    44 项单测（unittest）
+scripts/                  make_sample_data.py · e2e_m1.py · check_docs.py
+```
+
+> 说明：标注台按 ADR-0002 自建；设计文档里提到的 Vite+React+Konva 方案在 M1 用了「单文件原生 Canvas」实现（零构建、零外部依赖、体积更小），功能对齐 `docs/07-ui-spec.md` 的标注台要求（框选/8 向缩放/快捷键/预标注候选/草稿/亮度对比度）。

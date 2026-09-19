@@ -18,7 +18,14 @@
 | 上传限制 | 单文件 ≤ 50MB；单批次 ≤ 2GB；`source_dir` 必须落在 `configs/default.yaml: allowed_roots` 白名单内 |
 | 版本 | 契约版本随 `info.version`；不兼容变更升主版本并在 `manifest.json` 中标注 |
 
-## 2. 端点总览
+## 2. 实现状态（M1）
+
+| 状态 | 端点 |
+|---|---|
+| ✅ 已实现 | `/api/health`、`/api/classes`(GET/POST)、`/api/ingest/batches`(POST/GET)、`/api/ingest/upload`、`/api/ingest/batches/{id}`、`/api/images`、`/api/images/{id}/file`、`/api/tasks`、`/api/tasks/lease`、`/api/tasks/{id}`、`/api/tasks/{id}/annotations`(PUT)、`/api/tasks/{id}/adopt-candidates`、`/api/tasks/{id}/submit`、`/api/tasks/{id}/review`、`/api/datasets`(GET/POST)、`/api/datasets/{id}/freeze`、`/api/datasets/{id}/export`、`/api/runs`、`/api/stats/overview`、`/api/stats/export` |
+| ⏳ M2/M3 | `/api/tasks/{id}/prelabel`、`/api/prelabel/batches`、`/api/runs`(POST 训练)、`/api/runs/{id}/cancel`、`/api/models*`（当前返回 **501** 并说明所属里程碑） |
+
+## 3. 端点总览
 
 | Tag | 方法 | 路径 | 用途 |
 |---|---|---|---|
@@ -48,7 +55,7 @@
 | stats | GET | `/api/stats/overview` | 统计概览（类别分布/任务进度/标注效率/模型指标） |
 | stats | GET | `/api/stats/export` | 统计明细导出（CSV/JSON，含经纬度与路段号） |
 
-## 3. 错误码表
+## 4. 错误码表
 
 | code | HTTP | 含义与处理 |
 |---|---|---|
@@ -66,7 +73,7 @@
 | `quota_exceeded` | 429 | 批次体积/请求频率超限 |
 | `internal` | 500 | 未预期错误（附带 `details.trace_id`，日志可查） |
 
-## 4. 幂等与并发语义
+## 5. 幂等与并发语义
 
 - **导入**：以文件 `sha256` 为幂等键；同批重复导入返回 `dup_sha` 计数，不重复建任务。
 - **标注提交**：`PUT` 覆盖式 + `Idempotency-Key`；服务端按 `(task_id, annotation_id)` diff，写入 `audit_log`；同一 key 重复提交返回首次结果。
@@ -74,7 +81,7 @@
 - **预标注/训练**：`run_key = sha256(kind|target|params)`；同 key 返回既有 run（避免重复烧 GPU）。
 - **取消**：`cancel` 为协作式——当前 epoch/批次结束后停止；训练保留最近一次 checkpoint。
 
-## 5. CLI 契约（与 REST 同源，供巡检与自动化使用）
+## 6. CLI 契约（与 REST 同源，供巡检与自动化使用）
 
 ```
 rdinspect serve    [--host 127.0.0.1] [--port 8787] [--data-dir ./data]
@@ -94,7 +101,7 @@ rdinspect stats    [--csv out.csv]
 
 退出码：`0` 成功；`2` 参数错误；`3` 依赖缺失（模型/GPU/ffmpeg）；`4` 运行失败（详情写日志与 `runs`）；`5` 门禁未通过。
 
-## 6. 边缘推理输出格式（`results.jsonl`，每行一条）
+## 7. 边缘推理输出格式（`results.jsonl`，每行一条）
 
 ```json
 {"image":"frames/000123.jpg","ts":"2026-09-12T02:13:05Z","gps":{"lat":31.2304,"lon":121.4737},
@@ -107,7 +114,7 @@ rdinspect stats    [--csv out.csv]
 配套 `results.csv`（便于表格软件）：`image,ts,lat,lon,class,conf,x1,y1,x2,y2`。
 `manifest.json`（导出包内）声明 `schema_version`、类别顺序、阈值与切片参数；边缘端版本不匹配时拒绝启动并提示重新导出。
 
-## 7. 契约演进策略
+## 8. 契约演进策略
 
 - 新增字段：向后兼容，客户端忽略未知字段。
 - 类别顺序变化：**不改变端点**，但会使既有导出包与新数据集不兼容 → 通过数据集新版本 + 重新导出解决。

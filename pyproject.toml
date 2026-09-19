@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "road-inspect"
+version = "0.1.0"
+description = "轻量级道路灾害巡查：横向/纵向裂缝、坑洞、垃圾的采集、标注、训练与边缘离线推理"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+authors = [{ name = "xuwuyi51" }]
+dependencies = [
+  "fastapi>=0.115",
+  "uvicorn[standard]>=0.30",
+  "pillow>=10.2",
+  "numpy>=1.26",
+  "pyyaml>=6.0",
+  "python-multipart>=0.0.9",
+]
+
+[project.optional-dependencies]
+# 训练/预标注（AGPL，见 ADR-0003）：仅在需要训练或模型辅助标注时安装
+ml = ["ultralytics>=8.3", "onnxruntime>=1.18", "torch>=2.2"]
+dev = ["pytest>=8.0", "httpx>=0.27"]
+
+[project.scripts]
+rdinspect = "rdinspect.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+rdinspect = ["api/static/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

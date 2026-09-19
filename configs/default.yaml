@@ -5,10 +5,10 @@ server:
   workers: 1               # 单写者模型（SQLite）
 
 paths:
-  data_dir: /var/lib/road-inspect/data     # app.db 与文件根；可迁移到外接盘
-  logs_dir: /var/lib/road-inspect/logs
+  data_dir: ./data                          # app.db 与文件根（相对项目根；生产可改 /var/lib/road-inspect/data 或外接盘）
+  logs_dir: ./data/logs
   allowed_roots:                            # 允许登记为导入源的服务器目录（白名单）
-    - /var/lib/road-inspect/data/inbox
+    - ./data/inbox
   thumb_long_edge: 512
 
 ingest:

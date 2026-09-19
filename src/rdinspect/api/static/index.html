@@ -1,0 +1,1376 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>道路灾害巡查 · 标注台</title>
+<style>
+/* ============================ 主题与基础排版 ============================ */
+:root{
+  --bg:#111827; --panel:#1f2937; --panel2:#182030; --line:#374151; --line2:#4b5563;
+  --text:#e5e7eb; --muted:#9ca3af; --dim:#6b7280;
+  --accent:#2563eb; --accent2:#3b82f6; --danger:#ef4444; --warn:#f59e0b; --ok:#10b981;
+}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0}
+body{
+  background:var(--bg); color:var(--text);
+  font:13px/1.45 system-ui,-apple-system,"Segoe UI","Noto Sans CJK SC","Microsoft YaHei",sans-serif;
+  overflow:hidden; -webkit-font-smoothing:antialiased;
+}
+button,input,select{font:inherit;color:inherit}
+button{background:var(--line);border:1px solid var(--line2);border-radius:4px;padding:3px 8px;cursor:pointer}
+button:hover{background:#465063}
+button:disabled{opacity:.45;cursor:not-allowed}
+button.primary{background:var(--accent);border-color:var(--accent)}
+button.primary:hover{background:var(--accent2)}
+button.ghost{background:transparent}
+select,input[type=text]{background:#111827;border:1px solid var(--line2);border-radius:4px;padding:2px 6px}
+::-webkit-scrollbar{width:9px;height:9px}
+::-webkit-scrollbar-thumb{background:#3f4a5c;border-radius:5px}
+::-webkit-scrollbar-track{background:transparent}
+
+/* ============================== 整体骨架 ============================== */
+#app{display:flex;flex-direction:column;height:100vh}
+header{
+  height:36px;flex:0 0 36px;display:flex;align-items:center;gap:10px;padding:0 10px;
+  background:var(--panel);border-bottom:1px solid var(--line)
+}
+header .brand{display:flex;align-items:center;gap:6px;font-weight:600}
+header .meta{color:var(--muted);font-size:12px;display:flex;gap:10px;flex-wrap:wrap;overflow:hidden;white-space:nowrap}
+header .spread{flex:1}
+.dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--dim)}
+.dot.ok{background:var(--ok)} .dot.bad{background:var(--danger)}
+
+#banners{flex:0 0 auto}
+.banner{
+  display:flex;align-items:center;gap:8px;padding:5px 10px;font-size:12px;
+  background:#7f1d1d;border-bottom:1px solid #991b1b
+}
+.banner.warn{background:#78350f;border-bottom-color:#92400e}
+.banner .spread{flex:1}
+.banner button{background:rgba(255,255,255,.12);border-color:rgba(255,255,255,.25);padding:1px 7px}
+
+main{flex:1;display:grid;grid-template-columns:288px minmax(0,1fr) 320px;min-height:0}
+.col{display:flex;flex-direction:column;min-height:0;min-width:0}
+#colLeft{border-right:1px solid var(--line);background:var(--panel2)}
+#colRight{border-left:1px solid var(--line);background:var(--panel2)}
+.sec{padding:6px 8px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.sec h2{margin:0;font-size:12px;font-weight:600;color:var(--muted);letter-spacing:.5px}
+.sec .spread{flex:1}
+.scroll{flex:1;overflow:auto;min-height:0}
+
+/* ============================== 左：任务队列 ============================== */
+#queueCount{font-size:11px;color:var(--dim)}
+.task{
+  padding:5px 8px;border-bottom:1px solid #232c3b;cursor:pointer;
+  display:flex;align-items:center;gap:6px
+}
+.task:hover{background:#22304a}
+.task.active{background:#1d3557;box-shadow:inset 3px 0 0 var(--accent)}
+.task .tid{font-size:12px;font-variant-numeric:tabular-nums}
+.task .sub{font-size:11px;color:var(--dim)}
+.task .grow{flex:1;min-width:0;overflow:hidden}
+.task .nm{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:12px}
+.badge{font-size:10px;padding:1px 5px;border-radius:999px;border:1px solid var(--line2);color:var(--muted);white-space:nowrap}
+.badge.pending{color:#fcd34d;border-color:#a16207}
+.badge.leased{color:#93c5fd;border-color:#1d4ed8}
+.badge.prelabeled{color:#c4b5fd;border-color:#6d28d9}
+.badge.annotating{color:#93c5fd;border-color:#1d4ed8}
+.badge.annotated{color:#6ee7b7;border-color:#047857}
+.badge.submitted,.badge.reviewing{color:#fcd34d;border-color:#a16207}
+.badge.approved{color:#6ee7b7;border-color:#047857}
+.badge.rejected{color:#fca5a5;border-color:#b91c1c}
+.tag{font-size:10px;color:var(--dim);border:1px solid var(--line);border-radius:3px;padding:0 4px}
+.empty{padding:16px 10px;color:var(--dim);font-size:12px;text-align:center;line-height:1.8}
+
+/* ============================== 中：画布 ============================== */
+#canvasWrap{position:relative;flex:1;min-height:0;background:#0b1020;overflow:hidden}
+#imageCanvas{position:absolute;inset:0;transform-origin:0 0}
+#overlayCanvas{position:absolute;inset:0}
+#canvasWrap.panning{cursor:grabbing}
+#canvasWrap.cross{cursor:crosshair}
+#hint{
+  position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);text-align:center;
+  color:var(--dim);font-size:13px;pointer-events:none;line-height:2
+}
+#hint button{pointer-events:auto}
+.toolbar{display:flex;align-items:center;gap:6px;flex-wrap:wrap;padding:4px 8px;background:var(--panel);border-bottom:1px solid var(--line)}
+.toolbar label{font-size:11px;color:var(--muted);display:flex;align-items:center;gap:4px}
+.toolbar input[type=range]{width:82px;vertical-align:middle}
+.toolbar .sep{width:1px;height:16px;background:var(--line)}
+.toolbar .on{background:var(--accent);border-color:var(--accent)}
+
+/* ============================== 右：列表与类别条 ============================== */
+.ann{
+  padding:4px 8px;border-bottom:1px solid #232c3b;cursor:pointer;display:flex;gap:6px;align-items:flex-start
+}
+.ann:hover{background:#22304a}
+.ann.active{background:#1d3557;box-shadow:inset 3px 0 0 var(--accent)}
+.ann .sw{width:9px;height:9px;border-radius:2px;margin-top:4px;flex:0 0 auto}
+.ann .grow{flex:1;min-width:0}
+.ann .l1{display:flex;gap:6px;align-items:center}
+.ann .l1 .nm{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ann .l2{font-size:11px;color:var(--dim);font-variant-numeric:tabular-nums}
+.src{font-size:10px;padding:0 4px;border-radius:3px;border:1px solid var(--line2);color:var(--muted)}
+.src.model{color:#fcd34d;border-color:#a16207}
+.src.human{color:#6ee7b7;border-color:#047857}
+.src.model_edited{color:#93c5fd;border-color:#1d4ed8}
+#classBar{display:flex;flex-wrap:wrap;gap:4px;padding:6px 8px}
+.cls{
+  display:flex;align-items:center;gap:5px;padding:3px 7px;border-radius:4px;cursor:pointer;
+  background:var(--line);border:1px solid var(--line2);font-size:12px
+}
+.cls:hover{background:#465063}
+.cls.active{border-color:var(--text);box-shadow:0 0 0 1px var(--text) inset;background:#334155;font-weight:600}
+.cls .k{font-size:10px;color:var(--muted)}
+.cls .cd{width:10px;height:10px;border-radius:50%}
+
+/* ============================== 底：状态栏 ============================== */
+footer{
+  flex:0 0 30px;height:30px;display:flex;align-items:center;gap:12px;padding:0 10px;
+  background:var(--panel);border-top:1px solid var(--line);font-size:11px;color:var(--muted);
+  overflow:hidden;white-space:nowrap
+}
+footer b{color:var(--text);font-weight:600}
+footer .keys{overflow:hidden;text-overflow:ellipsis}
+kbd{
+  background:#111827;border:1px solid var(--line2);border-bottom-width:2px;border-radius:3px;
+  padding:0 4px;font-size:10px;font-family:inherit;color:var(--text)
+}
+
+/* ============================== 快捷键面板 ============================== */
+#help{
+  position:fixed;inset:0;background:rgba(3,7,18,.7);display:none;align-items:center;justify-content:center;z-index:50
+}
+#help.show{display:flex}
+#help .box{
+  width:520px;max-height:80vh;overflow:auto;background:var(--panel);border:1px solid var(--line2);
+  border-radius:8px;padding:14px 16px
+}
+#help h3{margin:0 0 10px;font-size:15px}
+#help table{border-collapse:collapse;width:100%}
+#help td{padding:3px 6px;border-bottom:1px solid #232c3b;font-size:12px}
+#help td:first-child{width:150px;color:var(--muted)}
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <span class="brand">
+      <svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true">
+        <path d="M8 1l7 13H1z" fill="none" stroke="#ef4444" stroke-width="1.4"/>
+        <path d="M8 5.5v4.2M8 11.4v1.2" stroke="#ef4444" stroke-width="1.4" stroke-linecap="round"/>
+      </svg>
+      道路灾害巡查 · 标注台
+    </span>
+    <span class="meta" id="headMeta">
+      <span><span class="dot" id="healthDot"></span> 后端 <span id="healthText">探测中…</span></span>
+      <span id="metaTask">任务 —</span>
+      <span id="metaImg">影像 —</span>
+      <span id="metaCand">候选 —</span>
+      <span id="metaSave">状态：空闲</span>
+    </span>
+    <span class="spread"></span>
+    <button id="btnHelp" class="ghost" title="快捷键（?）">? 快捷键</button>
+    <button id="btnRefresh" class="ghost">刷新队列</button>
+    <button id="btnSave" class="primary" disabled>S 保存并提交</button>
+  </header>
+
+  <div id="banners"></div>
+
+  <main>
+    <!-- ========================= 左栏：任务队列 ========================= -->
+    <section class="col" id="colLeft">
+      <div class="sec">
+        <h2>任务队列</h2>
+        <span class="spread"></span>
+        <span id="queueCount">0</span>
+      </div>
+      <div class="sec">
+        <button id="btnLease" class="primary">＋ 领取任务</button>
+        <select id="filterStatus" title="按状态过滤队列">
+          <option value="">全部状态</option>
+          <option value="pending">待标注</option>
+          <option value="prelabeled">已预标注</option>
+          <option value="annotating">标注中</option>
+          <option value="annotated">已标注</option>
+          <option value="submitted">已提交</option>
+          <option value="reviewing">复核中</option>
+          <option value="approved">已通过</option>
+          <option value="rejected">已打回</option>
+        </select>
+      </div>
+      <div class="scroll" id="queueList"></div>
+    </section>
+
+    <!-- ========================= 中栏：画布 ========================= -->
+    <section class="col">
+      <div class="toolbar">
+        <button id="btnToolBox" class="on" title="框选工具（B）">▭ 框</button>
+        <button id="btnToolSelect" title="选择/编辑工具（Esc 退出框选）">↖ 选择</button>
+        <span class="sep"></span>
+        <button id="btnFit" title="适应窗口">适应窗口</button>
+        <button id="btnZoomOut" title="缩小（Q）">－</button>
+        <span id="zoomText" style="font-size:11px;color:var(--muted);min-width:44px;text-align:center">—</span>
+        <button id="btnZoomIn" title="放大（E）">＋</button>
+        <span class="sep"></span>
+        <label>亮度 <input type="range" id="rangeBright" min="-100" max="100" step="1" value="0"><span id="brightVal" style="width:26px;text-align:right">0</span></label>
+        <label>对比度 <input type="range" id="rangeContrast" min="-100" max="100" step="1" value="0"><span id="contrastVal" style="width:26px;text-align:right">0</span></label>
+        <button id="btnResetBC" class="ghost" title="重置亮度/对比度">重置</button>
+        <span class="sep"></span>
+        <button id="btnAdoptAll" title="采纳全部模型候选（Z）">Z 采纳全部候选</button>
+        <span class="spread" style="flex:1"></span>
+        <span id="toolHint" style="font-size:11px;color:var(--dim)">左键在空白处拖拽即可新建框</span>
+      </div>
+      <div id="canvasWrap">
+        <canvas id="imageCanvas"></canvas>
+        <canvas id="overlayCanvas"></canvas>
+        <div id="hint">未加载任务<br><span style="font-size:12px">从左侧队列选择任务，或点击「＋ 领取任务」</span></div>
+      </div>
+    </section>
+
+    <!-- ========================= 右栏：标注列表 + 类别条 ========================= -->
+    <section class="col" id="colRight">
+      <div class="sec">
+        <h2>当前图标注</h2>
+        <span class="spread"></span>
+        <span id="annCount" style="font-size:11px;color:var(--dim)">0</span>
+      </div>
+      <div class="scroll" id="annList"></div>
+      <div class="sec" style="border-bottom:none;border-top:1px solid var(--line)">
+        <h2>类别（数字键 1‑9）</h2>
+      </div>
+      <div id="classBar" style="border-top:1px solid var(--line);max-height:150px;overflow:auto"></div>
+    </section>
+  </main>
+
+  <footer>
+    <span>图 <b id="stIdx">—</b></span>
+    <span>缩放 <b id="stZoom">—</b></span>
+    <span>坐标 <b id="stCoord">—</b></span>
+    <span>当前类 <b id="stClass">—</b></span>
+    <span>标注 <b id="stAnn">0</b></span>
+    <span>保存 <b id="stSave">—</b></span>
+    <span class="keys" title="完整列表按 ? 查看">
+      <kbd>1-9</kbd>选类 <kbd>B</kbd>框 <kbd>Delete</kbd>删除 <kbd>D</kbd>/<kbd>A</kbd>下/上一张
+      <kbd>C</kbd>复制上一张 <kbd>Z</kbd>采纳候选 <kbd>S</kbd>保存并提交 <kbd>Q</kbd>/<kbd>E</kbd>缩放
+      <kbd>空格</kbd>拖拽平移 <kbd>?</kbd>快捷键 <kbd>Esc</kbd>取消
+    </span>
+  </footer>
+</div>
+
+<div id="help">
+  <div class="box">
+    <h3>快捷键</h3>
+    <table>
+      <tr><td><kbd>1</kbd>…<kbd>9</kbd></td><td>选择类别（对应右栏类别条顺序）</td></tr>
+      <tr><td><kbd>B</kbd></td><td>新建框模式（取消选中，左键拖拽新建）</td></tr>
+      <tr><td><kbd>Delete</kbd> / <kbd>Backspace</kbd></td><td>删除选中框</td></tr>
+      <tr><td><kbd>D</kbd> / <kbd>A</kbd></td><td>下一张 / 上一张（已加载队列内）</td></tr>
+      <tr><td><kbd>C</kbd></td><td>复制上一张图的标注到当前图</td></tr>
+      <tr><td><kbd>Z</kbd></td><td>采纳全部模型候选（转为普通人工框）</td></tr>
+      <tr><td><kbd>S</kbd></td><td>保存并提交（PUT + submit），然后自动下一张</td></tr>
+      <tr><td><kbd>Q</kbd> / <kbd>E</kbd></td><td>缩小 / 放大（以视图中心为锚点）</td></tr>
+      <tr><td><kbd>?</kbd></td><td>打开 / 关闭本面板</td></tr>
+      <tr><td><kbd>Esc</kbd></td><td>取消当前绘制 / 关闭面板</td></tr>
+      <tr><td><kbd>滚轮</kbd></td><td>以光标为锚点缩放</td></tr>
+      <tr><td><kbd>空格</kbd>+拖拽 / <kbd>中键</kbd>拖拽</td><td>平移画布</td></tr>
+      <tr><td>双击标注</td><td>缩放定位到该框</td></tr>
+      <tr><td>拖拽已有框</td><td>移动；拖 8 向手柄可缩放</td></tr>
+    </table>
+    <div style="margin-top:10px;text-align:right"><button id="btnHelpClose" class="primary">关闭</button></div>
+  </div>
+</div>
+
+<script>
+'use strict';
+/* =====================================================================
+ * 道路灾害巡查 · 标注台（单文件前端，无构建 / 无依赖 / 同源调用 FastAPI）
+ * 坐标约定：服务端一律使用归一化 [0,1] 的 {x1,y1,x2,y2}，与影像像素尺寸无关。
+ * ===================================================================== */
+
+/* ------------------------------ 工具函数 ------------------------------ */
+const $ = (id) => document.getElementById(id);
+const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+const num = (v) => (v === null || v === undefined || v === '' ? null : Number(v));
+
+/** 千分位/紧凑数字，用于状态栏与列表 */
+function fmtPx(v) { return String(Math.round(v)); }
+/** 时间戳 → 本地时间 HH:MM:SS */
+function fmtTime(iso) {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return String(iso);
+  const p = (n) => String(n).padStart(2, '0');
+  return p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
+}
+
+/* ------------------------------ 全局状态 ------------------------------ */
+const STATUS_ZH = {
+  pending: '待标注', leased: '已领取', prelabeling: '预标注中', prelabeled: '已预标注',
+  annotating: '标注中', annotated: '已标注', submitted: '已提交', reviewing: '复核中',
+  approved: '已通过', rejected: '已打回', skipped: '已跳过'
+};
+const PRELABEL_ZH = { none: '无', queued: '排队中', done: '已完成', failed: '失败' };
+const DRAFT_PREFIX = 'draft:';
+const LAST_DRAFT_KEY = 'draft:lastTaskId';
+
+const state = {
+  classes: [],            // 全部类别（已按 order_index 排序）
+  activeClasses: [],      // active=true，用于类别条与数字键
+  curClassCode: null,
+  queue: [],              // 任务列表 [{id,image_id,status,priority,prelabel_state}]
+  curIndex: -1,           // 当前任务在 queue 中的下标（-1 = 未选中）
+  task: null,             // GET /api/tasks/{id} 的结果
+  anns: [],               // 当前图的标注（本地可编辑副本，坐标为归一化）
+  selectedId: null,       // 选中的本地标注 uid
+  img: null,              // HTMLImageElement（经 <img> 加载，避免大图 fetch）
+  imgW: 0, imgH: 0,       // 影像像素尺寸（含兜底推断）
+  imgNatW: 0, imgNatH: 0, // 自然尺寸
+  imgLoaded: false,
+  imgError: false,
+  view: { scale: 1, panX: 0, panY: 0 }, // 归一化→屏幕的仿射：screen = pan + 影像像素 * scale
+  bright: 0, contrast: 0,
+  dirty: false,           // 是否有未保存改动
+  busy: false,            // 正在请求（防止重复提交）
+  annSeq: 1,              // 本地 uid 生成器
+  cache: new Map()        // image_id → 标注快照，用于 C「复制上一张」
+};
+
+/* ------------------------------ 画布与渲染 ------------------------------ */
+const wrap = $('canvasWrap');
+const imageCanvas = $('imageCanvas');
+const overlayCanvas = $('overlayCanvas');
+const ictx = imageCanvas.getContext('2d');
+const octx = overlayCanvas.getContext('2d');
+const cv = { w: 0, h: 0, dpr: 1 };
+const HANDLES = ['nw', 'n', 'ne', 'e', 'se', 's', 'sw', 'w'];
+const HANDLE_HIT = 7;    // 手柄命中半径（屏幕像素）
+const MIN_BOX_PX = 3;    // 框最小屏幕尺寸（命中/绘制用）
+
+/* 影像像素坐标 ↔ 屏幕坐标（canvas 逻辑坐标） */
+function imgToScreen(px, py) {
+  return [state.view.panX + px * state.view.scale, state.view.panY + py * state.view.scale];
+}
+function screenToImg(sx, sy) {
+  return [(sx - state.view.panX) / state.view.scale, (sy - state.view.panY) / state.view.scale];
+}
+/* 归一化坐标 ↔ 屏幕坐标（归一化以影像像素尺寸为基准） */
+function normToScreen(x, y) { return imgToScreen(x * state.imgW, y * state.imgH); }
+function screenToNorm(sx, sy) {
+  const [px, py] = screenToImg(sx, sy);
+  return [state.imgW ? px / state.imgW : 0, state.imgH ? py / state.imgH : 0];
+}
+/** 框在屏幕上的矩形 {x,y,w,h} */
+function boxToScreen(b) {
+  const [x1, y1] = normToScreen(b.x1, b.y1);
+  const [x2, y2] = normToScreen(b.x2, b.y2);
+  return { x: x1, y: y1, w: x2 - x1, h: y2 - y1 };
+}
+
+/** 按容器尺寸重建两块画布（DPR 缩放，保证叠加层矢量清晰） */
+function resizeCanvas() {
+  const r = wrap.getBoundingClientRect();
+  const w = Math.max(1, Math.round(r.width)), h = Math.max(1, Math.round(r.height));
+  const dpr = window.devicePixelRatio || 1;
+  // 尺寸变化时保持视图中心不动，避免窗口缩放后影像跑偏
+  if (cv.w && cv.h && state.imgLoaded) {
+    state.view.panX += (w - cv.w) / 2;
+    state.view.panY += (h - cv.h) / 2;
+  }
+  cv.w = w; cv.h = h; cv.dpr = dpr;
+  [imageCanvas, overlayCanvas].forEach((c) => {
+    c.width = Math.round(w * dpr); c.height = Math.round(h * dpr);
+    c.style.width = w + 'px'; c.style.height = h + 'px';
+  });
+  render();
+}
+
+/** 仅影像层（带亮度/对比度 filter，不重绘叠加层） */
+function renderImage() {
+  ictx.setTransform(1, 0, 0, 1, 0, 0);
+  ictx.filter = 'none';
+  ictx.fillStyle = '#0b1020';
+  ictx.fillRect(0, 0, imageCanvas.width, imageCanvas.height);
+  if (state.imgLoaded) {
+    const b = clamp(1 + state.bright / 100, 0.05, 3);
+    const c = clamp(1 + state.contrast / 100, 0.05, 3);
+    ictx.setTransform(cv.dpr, 0, 0, cv.dpr, 0, 0);
+    ictx.filter = 'brightness(' + b.toFixed(3) + ') contrast(' + c.toFixed(3) + ')';
+    ictx.imageSmoothingEnabled = state.view.scale < 2;
+    const x = state.view.panX, y = state.view.panY;
+    ictx.drawImage(state.img, x, y, state.imgW * state.view.scale, state.imgH * state.view.scale);
+    ictx.filter = 'none';
+  }
+}
+
+/** 叠加层：所有框 + 标签 + 手柄 + 绘制预览 */
+function renderOverlay() {
+  octx.setTransform(cv.dpr, 0, 0, cv.dpr, 0, 0);
+  octx.clearRect(0, 0, cv.w, cv.h);
+  if (!state.imgLoaded) return;
+
+  for (const a of state.anns) {
+    const r = boxToScreen(a.bbox);
+    const isModel = a.source === 'model';
+    const sel = a.uid === state.selectedId;
+    const color = a.color || '#38bdf8';
+
+    octx.save();
+    octx.lineJoin = 'miter';
+    if (isModel) {
+      // 模型候选：虚线 + 半透明
+      octx.globalAlpha = sel ? 0.95 : 0.6;
+      octx.setLineDash([6, 4]);
+      octx.lineWidth = sel ? 2.5 : 1.6;
+    } else {
+      octx.globalAlpha = 1;
+      octx.setLineDash([]);
+      octx.lineWidth = sel ? 3 : 1.8;
+    }
+    octx.strokeStyle = sel ? '#ffffff' : color;
+    octx.strokeRect(r.x, r.y, r.w, r.h);
+    if (sel) { // 选中：再描一圈强调色
+      octx.globalAlpha = 0.9; octx.lineWidth = 1; octx.strokeStyle = color;
+      octx.strokeRect(r.x - 2, r.y - 2, r.w + 4, r.h + 4);
+    }
+    octx.restore();
+
+    // 标签：类别中文名 [+ 置信度]，贴框左上角
+    const label = a.name_zh + (a.score !== null && a.score !== undefined ? ' ' + Number(a.score).toFixed(2) : '');
+    octx.save();
+    octx.font = '11px system-ui,sans-serif';
+    octx.textBaseline = 'top';
+    const tw = octx.measureText(label).width;
+    const ly = r.y - 15 < 0 ? r.y + 1 : r.y - 15;
+    const lx = clamp(r.x, 0, Math.max(0, cv.w - tw - 8));
+    octx.globalAlpha = isModel ? 0.8 : 0.92;
+    octx.fillStyle = sel ? '#111827' : color;
+    octx.fillRect(lx, ly, tw + 7, 14);
+    octx.globalAlpha = 1;
+    octx.fillStyle = sel ? color : '#0b1020';
+    octx.fillText(label, lx + 3.5, ly + 1.5);
+    octx.restore();
+
+    // 选中框的 8 向手柄
+    if (sel) {
+      const n = state.anns.find((z) => z.uid === state.selectedId);
+      if (n) {
+        octx.save();
+        for (const h of HANDLES) {
+          const p = handlePoint(n.bbox, h);
+          octx.fillStyle = '#ffffff';
+          octx.strokeStyle = color;
+          octx.lineWidth = 1.2;
+          octx.fillRect(p[0] - 3.5, p[1] - 3.5, 7, 7);
+          octx.strokeRect(p[0] - 3.5, p[1] - 3.5, 7, 7);
+        }
+        octx.restore();
+      }
+    }
+  }
+
+  // 正在拖拽新建的框
+  if (drag && drag.mode === 'create' && drag.cur) {
+    const r = boxToScreen(normBox(drag.start[0], drag.start[1], drag.cur[0], drag.cur[1]));
+    octx.save();
+    octx.setLineDash([8, 4]);
+    octx.lineWidth = 2;
+    octx.strokeStyle = drag.color || '#38bdf8';
+    octx.strokeRect(r.x, r.y, r.w, r.h);
+    octx.fillStyle = (drag.color || '#38bdf8') + '33';
+    octx.fillRect(r.x, r.y, r.w, r.h);
+    octx.restore();
+  }
+  // 十字光标辅助线
+  if (cursorPos && !drag) {
+    octx.save();
+    octx.strokeStyle = 'rgba(148,163,184,.35)';
+    octx.lineWidth = 1;
+    octx.beginPath();
+    octx.moveTo(cursorPos[0] + .5, 0); octx.lineTo(cursorPos[0] + .5, cv.h);
+    octx.moveTo(0, cursorPos[1] + .5); octx.lineTo(cv.w, cursorPos[1] + .5);
+    octx.stroke();
+    octx.restore();
+  }
+}
+function render() { renderImage(); renderOverlay(); }
+
+/* ------------------------- 几何：归一化框与手柄 ------------------------- */
+function normBox(x1, y1, x2, y2) {
+  return { x1: Math.min(x1, x2), y1: Math.min(y1, y2), x2: Math.max(x1, x2), y2: Math.max(y1, y2) };
+}
+/** 手柄的屏幕坐标 */
+function handlePoint(b, h) {
+  const r = boxToScreen(b);
+  const cx = r.x + r.w / 2, cy = r.y + r.h / 2;
+  switch (h) {
+    case 'nw': return [r.x, r.y]; case 'n': return [cx, r.y]; case 'ne': return [r.x + r.w, r.y];
+    case 'e': return [r.x + r.w, cy]; case 'se': return [r.x + r.w, r.y + r.h];
+    case 's': return [cx, r.y + r.h]; case 'sw': return [r.x, r.y + r.h]; default: return [r.x, cy];
+  }
+}
+/** 命中检测：屏幕点是否落在框内；返回命中的标注（后绘制者优先 → 倒序） */
+function hitAnn(sx, sy) {
+  for (let i = state.anns.length - 1; i >= 0; i--) {
+    const r = boxToScreen(state.anns[i].bbox);
+    if (sx >= r.x - 2 && sx <= r.x + r.w + 2 && sy >= r.y - 2 && sy <= r.y + r.h + 2) return state.anns[i];
+  }
+  return null;
+}
+/** 手柄判定：仅对当前选中框生效，三角/边中点，命中即返回手柄名 */
+function hitHandle(a, sx, sy) {
+  if (!a) return null;
+  for (const h of HANDLES) {
+    const p = handlePoint(a.bbox, h);
+    if (Math.abs(sx - p[0]) <= HANDLE_HIT && Math.abs(sy - p[1]) <= HANDLE_HIT) return h;
+  }
+  return null;
+}
+/** 移动框并把整体夹在影像范围内（不改变尺寸） */
+function moveBoxClamped(b, dxN, dyN) {
+  const w = b.x2 - b.x1, h = b.y2 - b.y1;
+  const nx1 = clamp(b.x1 + dxN, 0, 1 - w);
+  const ny1 = clamp(b.y1 + dyN, 0, 1 - h);
+  return { x1: nx1, y1: ny1, x2: nx1 + w, y2: ny1 + h };
+}
+/** 手柄缩放：拖动的边随光标，被拖到反方向时自动翻转 */
+function resizeBox(orig, h, x1, y1, x2, y2, minN) {
+  let a1 = orig.x1, b1 = orig.y1, a2 = orig.x2, b2 = orig.y2;
+  if (h.indexOf('w') >= 0) a1 = x1;
+  if (h.indexOf('e') >= 0) a2 = x2;
+  if (h.indexOf('n') >= 0) b1 = y1;
+  if (h.indexOf('s') >= 0) b2 = y2;
+  const n = normBox(a1, b1, a2, b2);
+  if (n.x2 - n.x1 < minN) n.x2 = Math.min(1, n.x1 + minN);
+  if (n.y2 - n.y1 < minN) n.y2 = Math.min(1, n.y1 + minN);
+  return n;
+}
+function clampBox01(b) {
+  return { x1: clamp(b.x1, 0, 1), y1: clamp(b.y1, 0, 1), x2: clamp(b.x2, 0, 1), y2: clamp(b.y2, 0, 1) };
+}
+
+/* ------------------------------- 视图操作 ------------------------------- */
+/** 以屏幕点 (ax,ay) 为锚点缩放：该点下的影像内容保持不动 */
+function zoomAt(ax, ay, mul) {
+  const v = state.view;
+  const ns = clamp(v.scale * mul, 0.02, 60);
+  if (ns === v.scale) return;
+  const [px, py] = screenToImg(ax, ay);
+  v.scale = ns;
+  v.panX = ax - px * ns;
+  v.panY = ay - py * ns;
+  render();
+  updateStatus();
+}
+/** 适应窗口：等比缩放并居中 */
+function fitView() {
+  if (!state.imgLoaded) return;
+  const pad = 16;
+  const s = Math.min((cv.w - pad * 2) / state.imgW, (cv.h - pad * 2) / state.imgH);
+  const sc = clamp(s > 0 ? s : 1, 0.02, 60);
+  state.view.scale = sc;
+  state.view.panX = (cv.w - state.imgW * sc) / 2;
+  state.view.panY = (cv.h - state.imgH * sc) / 2;
+  render();
+  updateStatus();
+}
+/** 缩放到指定归一化框（双击标注列表） */
+function focusBox(b, factor) {
+  const pad = 60;
+  const bw = Math.max(1e-4, b.x2 - b.x1) * state.imgW;
+  const bh = Math.max(1e-4, b.y2 - b.y1) * state.imgH;
+  const s = clamp(Math.min((cv.w - pad * 2) / bw, (cv.h - pad * 2) / bh) * (factor || 0.6), 0.05, 40);
+  const cx = (b.x1 + b.x2) / 2 * state.imgW, cy = (b.y1 + b.y2) / 2 * state.imgH;
+  state.view.scale = s;
+  state.view.panX = cv.w / 2 - cx * s;
+  state.view.panY = cv.h / 2 - cy * s;
+  render();
+  updateStatus();
+}
+
+/* ------------------------------ 顶部提示条 ------------------------------ */
+function banner(msg, kind, closable) {
+  const el = document.createElement('div');
+  el.className = 'banner' + (kind === 'warn' ? ' warn' : '');
+  el.innerHTML = '<span>' + (kind === 'warn' ? '⚠️' : '⛔') + '</span><span class="spread"></span>';
+  const t = document.createElement('span');
+  t.textContent = msg;
+  el.insertBefore(t, el.children[1]);
+  const btn = document.createElement('button');
+  btn.textContent = '关闭';
+  btn.onclick = () => el.remove();
+  el.appendChild(btn);
+  if (!closable) setTimeout(() => el.remove(), 4000);
+  $('banners').appendChild(el);
+  return el;
+}
+function toast(msg) { banner(msg, 'warn', false); }
+
+/* ------------------------------ API 客户端 ------------------------------ */
+async function api(path, options) {
+  const opt = options || {};
+  const init = { method: opt.method || 'GET', headers: {} };
+  if (opt.body !== undefined) {
+    init.headers['Content-Type'] = 'application/json';
+    init.body = JSON.stringify(opt.body);
+  }
+  let res;
+  try {
+    res = await fetch(path, init);
+  } catch (e) {
+    throw new Error('网络请求失败：' + (e && e.message ? e.message : e));
+  }
+  const text = await res.text();
+  let data = null;
+  if (text) { try { data = JSON.parse(text); } catch (e) { data = null; } }
+  if (!res.ok) {
+    const code = data && data.code ? data.code : res.status;
+    const msg = data && data.message ? data.message : (text ? text.slice(0, 200) : res.statusText);
+    throw new Error('接口 ' + path + ' 失败（' + res.status + ' ' + code + '）：' + msg);
+  }
+  return data;
+}
+const API = {
+  health: () => api('/api/health'),
+  classes: () => api('/api/classes'),
+  tasks: (strategy, limit) => api('/api/tasks?strategy=' + encodeURIComponent(strategy) + '&limit=' + limit),
+  lease: (body) => api('/api/tasks/lease', { method: 'POST', body }),
+  task: (id) => api('/api/tasks/' + encodeURIComponent(id)),
+  putAnnotations: (id, anns) => api('/api/tasks/' + encodeURIComponent(id) + '/annotations', { method: 'PUT', body: { annotations: anns } }),
+  submit: (id) => api('/api/tasks/' + encodeURIComponent(id) + '/submit', { method: 'POST' }),
+  imageFileUrl: (imageId) => '/api/images/' + encodeURIComponent(imageId) + '/file'
+};
+
+/* ------------------------------ 启动探测 ------------------------------ */
+async function probeHealth() {
+  const dot = $('healthDot'), txt = $('healthText');
+  try {
+    const h = await API.health();
+    dot.className = 'dot ok';
+    txt.textContent = '正常' + (h && h.status ? '（' + h.status + '）' : '');
+  } catch (e) {
+    dot.className = 'dot bad';
+    txt.textContent = '不可用';
+    banner('后端健康检查失败：' + e.message + '（界面仍可使用，操作会实时提示错误）', 'error', true);
+  }
+}
+
+/* ------------------------------ 类别加载 ------------------------------ */
+async function loadClasses() {
+  try {
+    const list = await API.classes();
+    state.classes = (list || []).slice().sort((a, b) => (a.order_index || 0) - (b.order_index || 0));
+    state.activeClasses = state.classes.filter((c) => c.active !== false); // 只显示 active=true
+    if (state.activeClasses.length && !classByCode(state.curClassCode)) {
+      state.curClassCode = state.activeClasses[0].code;
+    }
+    renderClassBar();
+    updateStatus();
+  } catch (e) {
+    banner('类别加载失败：' + e.message, 'error', true);
+  }
+}
+function classByCode(code) { return state.classes.find((c) => c.code === code) || null; }
+function classColor(code) { const c = classByCode(code); return c && c.color ? c.color : '#38bdf8'; }
+function className(code) { const c = classByCode(code); return c ? c.name_zh : code; }
+
+function renderClassBar() {
+  const bar = $('classBar');
+  bar.innerHTML = '';
+  state.activeClasses.forEach((c, i) => {
+    const el = document.createElement('div');
+    el.className = 'cls' + (c.code === state.curClassCode ? ' active' : '');
+    el.title = c.name_zh + ' / ' + c.name_en + (c.is_crack ? '（裂缝类）' : '');
+    const k = document.createElement('span'); k.className = 'k'; k.textContent = i < 9 ? String(i + 1) : '·';
+    const d = document.createElement('span'); d.className = 'cd'; d.style.background = c.color || '#888';
+    const n = document.createElement('span'); n.textContent = c.name_zh;
+    el.append(k, d, n);
+    el.onclick = () => { setClass(c.code); };
+    bar.appendChild(el);
+  });
+  if (!state.activeClasses.length) bar.innerHTML = '<div class="empty">无可用类别（/api/classes 为空）</div>';
+}
+function setClass(code) {
+  state.curClassCode = code;
+  renderClassBar();
+  updateStatus();
+  // 已有选中框时同时改类别（常见标注动线）
+  const sel = state.anns.find((a) => a.uid === state.selectedId);
+  if (sel) { sel.class_code = code; sel.color = classColor(code); markDirty(); renderAnnList(); render(); }
+}
+
+/* ------------------------------ 任务队列 ------------------------------ */
+function queueIndexById(id) { return state.queue.findIndex((t) => String(t.id) === String(id)); }
+
+async function loadQueue() {
+  try {
+    const data = await API.tasks('priority', 50);
+    const items = (data && data.items) || [];
+    state.queue = items.slice();
+    // 若当前任务已在队列中，保持下标同步
+    if (state.task) {
+      const i = queueIndexById(state.task.id);
+      state.curIndex = i >= 0 ? i : state.curIndex;
+    }
+    renderQueue();
+    updateStatus();
+  } catch (e) {
+    banner('任务队列加载失败：' + e.message, 'error', true);
+  }
+}
+
+function renderQueue() {
+  const box = $('queueList');
+  const filter = $('filterStatus').value;
+  const rows = state.queue.filter((t) => !filter || t.status === filter);
+  box.innerHTML = '';
+  $('queueCount').textContent = filter
+    ? rows.length + ' / ' + state.queue.length
+    : String(state.queue.length);
+  if (!rows.length) {
+    box.innerHTML = '<div class="empty">' + (state.queue.length ? '当前筛选下没有任务' : '队列为空<br>点击「＋ 领取任务」从待标注池领取') + '</div>';
+    return;
+  }
+  for (const t of rows) {
+    const el = document.createElement('div');
+    el.className = 'task' + (state.task && String(t.id) === String(state.task.id) ? ' active' : '');
+    const st = t.status || 'pending';
+    el.innerHTML =
+      '<div class="grow">' +
+        '<div class="l1 nm">#' + t.id + ' · 影像 ' + t.image_id + '</div>' +
+        '<div class="sub">优先级 ' + (t.priority === null || t.priority === undefined ? '—' : t.priority) +
+          (t.prelabel_state && t.prelabel_state !== 'none' ? ' · 预标注 ' + (PRELABEL_ZH[t.prelabel_state] || t.prelabel_state) : '') +
+        '</div>' +
+      '</div>' +
+      '<span class="badge ' + st + '">' + (STATUS_ZH[st] || st) + '</span>';
+    el.onclick = () => { openTask(t); };
+    box.appendChild(el);
+  }
+}
+
+/** 领取任务：POST /api/tasks/lease */
+async function leaseTask() {
+  try {
+    const r = await API.lease({ count: 1, status: 'pending', assignee: 'web' });
+    const leased = (r && r.leased) || [];
+    if (!leased.length) { toast('没有可领取的任务（待标注池为空或已被他人领取）'); return; }
+    for (const t of leased) {
+      const i = queueIndexById(t.id);
+      if (i >= 0) state.queue[i] = Object.assign({}, state.queue[i], t);
+      else state.queue.unshift(t);
+    }
+    renderQueue();
+    await openTask(leased[0]);
+  } catch (e) {
+    banner('领取任务失败：' + e.message, 'error', true);
+  }
+}
+
+/* ------------------------------ 草稿（localStorage） ------------------------------ */
+function draftKey(taskId) { return DRAFT_PREFIX + taskId; }
+/** 序列化：只保留契约字段 + 本地 uid/source/score 便于恢复展示（id 保留以便草稿恢复后仍指向同一标注） */
+function serializeAnns(anns) {
+  return anns.map((a) => ({
+    id: a.id === undefined ? null : a.id,
+    uid: a.uid, class_code: a.class_code, kind: 'bbox',
+    bbox: { x1: a.bbox.x1, y1: a.bbox.y1, x2: a.bbox.x2, y2: a.bbox.y2 },
+    source: a.source, score: a.score, difficult: !!a.difficult
+  }));
+}
+function saveDraft(force) {
+  if (!state.task) return;
+  if (!state.dirty && !force) return;
+  try {
+    const payload = { taskId: state.task.id, imageId: state.task.image_id, ts: Date.now(), annotations: serializeAnns(state.anns) };
+    localStorage.setItem(draftKey(state.task.id), JSON.stringify(payload));
+    localStorage.setItem(LAST_DRAFT_KEY, String(state.task.id));
+    setSaveStatus('已存草稿 ' + fmtTime(new Date().toISOString()));
+  } catch (e) { /* 存储不可用（隐私模式/超限）时静默降级 */ }
+}
+function readDraft(taskId) {
+  try {
+    const raw = localStorage.getItem(draftKey(taskId));
+    if (!raw) return null;
+    const d = JSON.parse(raw);
+    if (!d || !Array.isArray(d.annotations)) return null;
+    return d;
+  } catch (e) { return null; }
+}
+function clearDraft(taskId) {
+  try { localStorage.removeItem(draftKey(taskId)); } catch (e) {}
+}
+function markDirty() {
+  state.dirty = true;
+  setSaveStatus('未保存');
+  clearTimeout(markDirty._t);
+  markDirty._t = setTimeout(() => saveDraft(false), 1200); // 改动后自动存草稿
+}
+function setSaveStatus(text) { $('metaSave').textContent = '状态：' + text; $('stSave').textContent = text; }
+
+/* ------------------------------ 任务加载 ------------------------------ */
+/** 把服务端 Annotation → 本地可编辑结构 */
+function fromServer(a) {
+  const src = a.source || (a.score !== null && a.score !== undefined ? 'model' : 'human');
+  return {
+    uid: 's' + (a.id !== null && a.id !== undefined ? a.id : state.annSeq++),
+    id: a.id, class_code: a.class_code, kind: a.kind || 'bbox',
+    bbox: { x1: num(a.bbox && a.bbox.x1) || 0, y1: num(a.bbox && a.bbox.y1) || 0, x2: num(a.bbox && a.bbox.x2) || 0, y2: num(a.bbox && a.bbox.y2) || 0 },
+    source: src, score: num(a.score), difficult: !!a.difficult, color: classColor(a.class_code)
+  };
+}
+/** 本地结构 → PUT /annotations 的契约载荷（坐标裁剪到 [0,1]） */
+function toPayload(anns) {
+  return anns.map((a) => ({
+    class_code: a.class_code, kind: 'bbox',
+    bbox: {
+      x1: clamp(a.bbox.x1, 0, 1), y1: clamp(a.bbox.y1, 0, 1),
+      x2: clamp(a.bbox.x2, 0, 1), y2: clamp(a.bbox.y2, 0, 1)
+    },
+    difficult: !!a.difficult
+  }));
+}
+
+/** 打开任务：GET /api/tasks/{id}，处理草稿询问与旧图草稿落盘 */
+async function openTask(t) {
+  if (!t) return;
+  if (state.task && String(state.task.id) === String(t.id)) { state.curIndex = queueIndexById(t.id); renderQueue(); return; }
+  if (state.task && state.dirty) {
+    saveDraft(true); // 切换前把未保存标注落到 localStorage
+    const ok = confirm('当前任务 #' + state.task.id + ' 有未保存的标注。\n草稿已自动保存到本地。是否继续切换到任务 #' + t.id + '？');
+    if (!ok) return;
+  }
+  state.busy = true;
+  setSaveStatus('加载中…');
+  updateStatus();
+  try {
+    const detail = await API.task(t.id);
+    state.task = detail;
+    state.curIndex = queueIndexById(t.id);
+    state.anns = (detail.annotations || []).map(fromServer);
+    // 记录来源快照，用于 C「复制上一张图标注」
+    if (detail.image_id !== undefined && detail.image_id !== null) {
+      state.cache.set(String(detail.image_id), serializeAnns(state.anns));
+    }
+    state.dirty = false;
+    state.selectedId = null;
+    renderAnnList();
+    await loadImage(detail);
+
+    // 草稿恢复询问
+    const d = readDraft(detail.id);
+    if (d && d.annotations && d.annotations.length && differentFromServer(d.annotations, state.anns)) {
+      if (confirm('检测到任务 #' + detail.id + ' 的本地草稿（' + d.annotations.length + ' 个标注，' +
+        new Date(d.ts).toLocaleString() + '）。\n是否恢复草稿？\n（取消 = 丢弃草稿并保留服务端版本）')) {
+        state.anns = d.annotations.map((a) => ({
+          uid: a.uid && state.anns.some((x) => x.uid === a.uid) ? a.uid : 'd' + (state.annSeq++),
+          id: (a.id === undefined || a.id === null) ? null : a.id, // 保留服务端 id，避免恢复后被误判为新增
+          class_code: a.class_code, kind: 'bbox',
+          bbox: { x1: num(a.bbox.x1) || 0, y1: num(a.bbox.y1) || 0, x2: num(a.bbox.x2) || 0, y2: num(a.bbox.y2) || 0 },
+          source: a.source || 'human', score: num(a.score), difficult: !!a.difficult, color: classColor(a.class_code)
+        }));
+        state.dirty = true;
+        setSaveStatus('已恢复草稿');
+        renderAnnList();
+      } else {
+        clearDraft(detail.id);
+        setSaveStatus('未保存');
+      }
+    } else {
+      setSaveStatus('已同步');
+    }
+    if (state.activeClasses.length && !classByCode(state.curClassCode)) state.curClassCode = state.activeClasses[0].code;
+    renderQueue(); renderClassBar(); render(); renderAnnList(); updateStatus();
+  } catch (e) {
+    banner('任务 #' + t.id + ' 加载失败：' + e.message, 'error', true);
+    setSaveStatus('加载失败');
+  } finally {
+    state.busy = false;
+  }
+}
+/** 草稿与服务端是否实质不同（粗比较，坐标 1e-6 容差） */
+function differentFromServer(draftAnns, serverAnns) {
+  if (draftAnns.length !== serverAnns.length) return true;
+  const key = (a) => [a.class_code, (a.bbox.x1).toFixed(6), (a.bbox.y1).toFixed(6), (a.bbox.x2).toFixed(6), (a.bbox.y2).toFixed(6)].join('|');
+  const s = new Set(serverAnns.map(key));
+  return draftAnns.some((a) => !s.has(key(a)));
+}
+
+/** 用 <img> 加载影像字节流（大图直出，避免 fetch → blob） */
+function loadImage(detail) {
+  return new Promise((resolve) => {
+    const img = new Image();
+    state.img = img; state.imgLoaded = false; state.imgError = false;
+    state.imgNatW = 0; state.imgNatH = 0;
+    const im = detail.image || {};
+    const onOk = () => {
+      state.imgLoaded = true;
+      state.imgNatW = img.naturalWidth || 0;
+      state.imgNatH = img.naturalHeight || 0;
+      // 尺寸来源优先级：image.width/height → 自然尺寸 → 1（退化时仍按归一化显示）
+      state.imgW = num(im.width) || state.imgNatW || 1;
+      state.imgH = num(im.height) || state.imgNatH || 1;
+      $('hint').style.display = 'none';
+      fitView();
+      renderAnnList();
+      updateStatus();
+      resolve();
+    };
+    const onErr = () => {
+      state.imgError = true; state.imgLoaded = false;
+      state.img = null;               // 避免沿用上一张影像残留画面
+      state.imgW = num(im.width) || 1; state.imgH = num(im.height) || 1;
+      showImageError(detail);
+      render();
+      resolve();
+    };
+    img.onload = onOk;
+    img.onerror = onErr;
+    img.src = API.imageFileUrl(detail.image_id);
+  });
+}
+function showImageError(detail) {
+  const h = $('hint');
+  h.style.display = 'block';
+  h.innerHTML = '影像加载失败（image_id=' + detail.image_id + '）<br>' +
+    '<span style="font-size:12px">可点「重新加载」，或稍后重试；网络恢复后不影响标注草稿</span><br>' +
+    '<button id="btnRetryImg" class="primary">重新加载</button>';
+  $('btnRetryImg').onclick = async () => {
+    try {
+      const fresh = await API.task(detail.id);
+      state.task = fresh;
+      await loadImage(fresh);
+    } catch (e) { banner('重新加载失败：' + e.message, 'error', true); }
+  };
+}
+
+/* ------------------------------ 标注列表 ------------------------------ */
+function renderAnnList() {
+  const box = $('annList');
+  box.innerHTML = '';
+  const models = state.anns.filter((a) => a.source === 'model').length;
+  $('annCount').textContent = state.anns.length + ' 条' + (models ? '（候选 ' + models + '）' : '');
+  $('metaCand').textContent = '候选 ' + models;
+  if (!state.anns.length) {
+    box.innerHTML = '<div class="empty">暂无标注<br>在画布空白处拖拽新建框</div>';
+    return;
+  }
+  const w = state.imgW, h = state.imgH;
+  state.anns.forEach((a) => {
+    const el = document.createElement('div');
+    el.className = 'ann' + (a.uid === state.selectedId ? ' active' : '');
+    const px = Math.round((a.bbox.x2 - a.bbox.x1) * w), py = Math.round((a.bbox.y2 - a.bbox.y1) * h);
+    el.innerHTML =
+      '<span class="sw" style="background:' + (a.color || '#38bdf8') + '"></span>' +
+      '<div class="grow">' +
+        '<div class="l1"><span class="nm">' + className(a.class_code) + '</span>' +
+          '<span class="src ' + (a.source || 'human') + '">' +
+            (a.source === 'model' ? '模型' : a.source === 'model_edited' ? '模型改' : '人工') + '</span>' +
+          (a.score !== null && a.score !== undefined ? '<span class="sub">' + Number(a.score).toFixed(2) + '</span>' : '') +
+        '</div>' +
+        '<div class="l2">' + px + '×' + py + ' px · 归一化 ' +
+          a.bbox.x1.toFixed(3) + ',' + a.bbox.y1.toFixed(3) + ' → ' + a.bbox.x2.toFixed(3) + ',' + a.bbox.y2.toFixed(3) +
+        '</div>' +
+      '</div>';
+    el.onclick = () => { selectAnn(a.uid, false); };
+    el.ondblclick = () => { selectAnn(a.uid, false); focusBox(a.bbox, 0.6); };
+    box.appendChild(el);
+  });
+}
+function selectAnn(uid, scrollList) {
+  state.selectedId = uid;
+  renderAnnList(); render();
+  if (scrollList !== false) {
+    const idx = state.anns.findIndex((a) => a.uid === uid);
+    const node = $('annList').children[idx];
+    if (node && node.scrollIntoView) node.scrollIntoView({ block: 'nearest' });
+  }
+}
+function selectedAnn() { return state.anns.find((a) => a.uid === state.selectedId) || null; }
+
+/* ------------------------------ 标注增删 ------------------------------ */
+function addAnn(classCode, bbox) {
+  const a = {
+    uid: 'n' + (state.annSeq++), id: null, class_code: classCode, kind: 'bbox',
+    bbox: bbox, source: 'human', score: null, difficult: false, color: classColor(classCode)
+  };
+  state.anns.push(a);
+  state.selectedId = a.uid;
+  markDirty(); renderAnnList(); render();
+  return a;
+}
+function deleteSelected() {
+  if (!state.selectedId) return;
+  const i = state.anns.findIndex((a) => a.uid === state.selectedId);
+  if (i < 0) return;
+  state.anns.splice(i, 1);
+  state.selectedId = null;
+  markDirty(); renderAnnList(); render(); updateStatus();
+}
+
+/* ------------------------------ 保存 / 提交 ------------------------------ */
+/** S：PUT 全量标注 → POST submit → 队列刷新 → 自动下一张 */
+async function saveAndSubmit() {
+  if (!state.task || state.busy) return;
+  state.busy = true;
+  setSaveStatus('保存中…');
+  const taskId = state.task.id;
+  try {
+    const r = await API.putAnnotations(taskId, toPayload(state.anns));
+    // 用服务端返回（含 id / 推导出的 source）刷新本地
+    if (r && Array.isArray(r.annotations)) {
+      state.anns = r.annotations.map(fromServer);
+      renderAnnList();
+    }
+    state.dirty = false;
+    clearDraft(taskId);
+    setSaveStatus('已保存，提交中…');
+    await API.submit(taskId);
+    const cur = state.queue.find((t) => String(t.id) === String(taskId));
+    if (cur) cur.status = 'submitted';
+    // 提交成功后缓存该图标注（供下一张 C 复制）
+    if (state.task.image_id !== undefined) state.cache.set(String(state.task.image_id), serializeAnns(state.anns));
+    setSaveStatus('已提交');
+    toast('任务 #' + taskId + ' 已保存并提交进入复核');
+    renderQueue();
+    const next = nextTaskRef();
+    if (next) await openTask(next);
+  } catch (e) {
+    state.dirty = true;
+    setSaveStatus('保存失败');
+    banner('保存/提交失败：' + e.message + '（草稿仍在本地，可重试）', 'error', true);
+    saveDraft(true);
+  } finally {
+    state.busy = false;
+    updateStatus();
+  }
+}
+/** 仅保存（不提交），用于内部草稿归档 */
+async function saveOnly() {
+  if (!state.task) return 0;
+  const r = await API.putAnnotations(state.task.id, toPayload(state.anns));
+  if (r && Array.isArray(r.annotations)) { state.anns = r.annotations.map(fromServer); renderAnnList(); }
+  state.dirty = false;
+  clearDraft(state.task.id);
+  setSaveStatus('已保存');
+  return r ? r.changed : 0;
+}
+
+/* ------------------------------ 队列切换 ------------------------------ */
+function nextTaskRef() {
+  if (state.curIndex >= 0 && state.curIndex + 1 < state.queue.length) return state.queue[state.curIndex + 1];
+  return null;
+}
+function prevTaskRef() {
+  if (state.curIndex > 0) return state.queue[state.curIndex - 1];
+  return null;
+}
+async function goNext() {
+  const n = nextTaskRef();
+  if (!n) { toast('已经是队列最后一张'); return; }
+  await openTask(n);
+}
+async function goPrev() {
+  const p = prevTaskRef();
+  if (!p) { toast('已经是队列第一张'); return; }
+  await openTask(p);
+}
+
+/** C：复制上一张图的标注（同 image 缓存 → 否则取队列上一张的本地缓存） */
+function copyFromPrevious() {
+  if (!state.task) return;
+  let src = null, from = null;
+  if (state.curIndex > 0) {
+    const prev = state.queue[state.curIndex - 1];
+    const key = prev && prev.image_id !== undefined ? String(prev.image_id) : null;
+    if (key && state.cache.has(key)) { src = state.cache.get(key); from = '队列上一张（影像 ' + prev.image_id + '）'; }
+  }
+  if (!src) { toast('没有可复制的上一张标注缓存'); return; }
+  if (state.anns.length && !confirm('当前图已有 ' + state.anns.length + ' 个标注，复制 ' + src.length + ' 个标注会追加到列表中。继续？')) return;
+  for (const a of src) {
+    // 关键：复制出的框必须去掉服务端 id，否则 PUT 会被当成「更新原标注」而不是新建
+    state.anns.push({
+      uid: 'c' + (state.annSeq++), id: null, class_code: a.class_code, kind: 'bbox',
+      bbox: { x1: a.bbox.x1, y1: a.bbox.y1, x2: a.bbox.x2, y2: a.bbox.y2 },
+      source: 'human', score: null, difficult: !!a.difficult, color: classColor(a.class_code)
+    });
+  }
+  markDirty(); renderAnnList(); render();
+  toast('已从 ' + from + ' 复制 ' + src.length + ' 个标注（请按需修正）');
+}
+/** Z：采纳全部模型候选（source=model → model_edited） */
+function adoptAllCandidates() {
+  let n = 0;
+  for (const a of state.anns) {
+    if (a.source === 'model') { a.source = 'model_edited'; n++; }
+  }
+  if (!n) { toast('当前图没有未采纳的模型候选'); return; }
+  markDirty(); renderAnnList(); render();
+  toast('已采纳 ' + n + ' 个模型候选，可继续调整');
+}
+
+/* ------------------------------ 交互：指针 ------------------------------ */
+let drag = null;          // {mode:'pan'|'create'|'move'|'resize', ...}
+let cursorPos = null;     // 叠加层十字线位置（canvas 逻辑坐标）
+let spaceDown = false;
+let tool = 'box';         // box | select
+
+function localPoint(ev) {
+  const r = wrap.getBoundingClientRect();
+  return [ev.clientX - r.left, ev.clientY - r.top];
+}
+
+wrap.addEventListener('wheel', (ev) => {
+  if (!state.imgLoaded) return;
+  ev.preventDefault();
+  const [x, y] = localPoint(ev);
+  const mul = ev.deltaY < 0 ? 1.12 : 1 / 1.12;
+  zoomAt(x, y, mul);
+}, { passive: false });
+
+wrap.addEventListener('contextmenu', (ev) => ev.preventDefault());
+
+wrap.addEventListener('pointerdown', (ev) => {
+  if (!state.imgLoaded) return;
+  const [x, y] = localPoint(ev);
+  wrap.setPointerCapture && wrap.setPointerCapture(ev.pointerId);
+
+  // 中键或「空格 + 左键」→ 平移
+  if (ev.button === 1 || (ev.button === 0 && spaceDown)) {
+    drag = { mode: 'pan', sx: x, sy: y, panX: state.view.panX, panY: state.view.panY };
+    wrap.classList.add('panning');
+    ev.preventDefault();
+    return;
+  }
+  if (ev.button !== 0) return;
+
+  const sel = selectedAnn();
+  // 1) 命中手柄 → 缩放（仅当前选中框）
+  const h = hitHandle(sel, x, y);
+  if (h && ev.detail < 2) {
+    drag = { mode: 'resize', handle: h, orig: Object.assign({}, sel.bbox), start: [x, y], moved: false, uid: sel.uid };
+    return;
+  }
+  // 2) 命中已有框 → 选中并可拖动
+  const hit = hitAnn(x, y);
+  if (hit) {
+    if (state.selectedId !== hit.uid) selectAnn(hit.uid, true);
+    const [nx, ny] = screenToNorm(x, y);
+    drag = { mode: 'move', uid: hit.uid, orig: Object.assign({}, hit.bbox), start: [x, y], startNorm: [nx, ny], origAnn: Object.assign({}, hit), moved: false };
+    return;
+  }
+  // 3) 空白处：框选工具 → 新建；选择工具 → 取消选中
+  if (tool === 'select') { state.selectedId = null; renderAnnList(); render(); return; }
+  const [nx, ny] = screenToNorm(x, y);
+  drag = { mode: 'create', start: [clamp(nx, 0, 1), clamp(ny, 0, 1)], cur: null, color: classColor(state.curClassCode), startScreen: [x, y] };
+});
+
+wrap.addEventListener('pointermove', (ev) => {
+  const [x, y] = localPoint(ev);
+  cursorPos = [x, y];
+  if (drag) {
+    if (drag.mode === 'pan') {
+      state.view.panX = drag.panX + (x - drag.sx);
+      state.view.panY = drag.panY + (y - drag.sy);
+      render();
+      return;
+    }
+    if (drag.mode === 'create') {
+      const [nx, ny] = screenToNorm(x, y);
+      drag.cur = [clamp(nx, 0, 1), clamp(ny, 0, 1)];
+      renderOverlay();
+      return;
+    }
+    if (drag.mode === 'move') {
+      const a = state.anns.find((z) => z.uid === drag.uid);
+      if (!a) return;
+      const [nx, ny] = screenToNorm(x, y);
+      a.bbox = moveBoxClamped(drag.orig, nx - drag.startNorm[0], ny - drag.startNorm[1]);
+      drag.moved = true;
+      markDirty(); renderOverlay(); updateStatus();
+      return;
+    }
+    if (drag.mode === 'resize') {
+      const a = state.anns.find((z) => z.uid === drag.uid);
+      if (!a) return;
+      const [nx, ny] = screenToNorm(x, y);
+      const minN = Math.max(MIN_BOX_PX / Math.max(1, state.imgW), MIN_BOX_PX / Math.max(1, state.imgH));
+      // 光标归一化坐标越界也要允许（便于贴边），最终由 clamp 收拢
+      a.bbox = clampBox01(resizeBox(drag.orig, drag.handle, clamp(nx, -0.2, 1.2), clamp(ny, -0.2, 1.2), clamp(nx, -0.2, 1.2), clamp(ny, -0.2, 1.2), minN));
+      drag.moved = true;
+      markDirty(); renderOverlay(); updateStatus();
+      return;
+    }
+  }
+  if (!state.imgLoaded) return;
+  // 悬停在选中框手柄上时切换光标
+  const sel = selectedAnn();
+  const hh = hitHandle(sel, x, y);
+  const cur = hh ? (hh === 'nw' || hh === 'se' ? 'nwse-resize' : hh === 'ne' || hh === 'sw' ? 'nesw-resize' : hh === 'n' || hh === 's' ? 'ns-resize' : 'ew-resize') : '';
+  wrap.style.cursor = spaceDown ? 'grab' : hh ? cur : hitAnn(x, y) ? 'move' : tool === 'box' ? 'crosshair' : 'default';
+  renderOverlay();
+  updateStatus();
+});
+
+function endDrag(ev) {
+  if (!drag) return;
+  const d = drag; drag = null;
+  wrap.classList.remove('panning');
+  if (d.mode === 'create') {
+    if (d.cur) {
+      const b = normBox(d.start[0], d.start[1], d.cur[0], d.cur[1]);
+      const wpx = (b.x2 - b.x1) * state.imgW, hpx = (b.y2 - b.y1) * state.imgH;
+      // 过小的框自动扩大到最小可用尺寸（不以屏幕像素为准，而是影像像素，保证可再次选中）
+      if (wpx < 2 || hpx < 2) {
+        toast('框太小（<2px），已忽略；如需小目标请放大后绘制');
+        render();
+        return;
+      }
+      addAnn(state.curClassCode, b);
+      updateStatus();
+    }
+    render();
+    return;
+  }
+  if ((d.mode === 'move' || d.mode === 'resize') && !d.moved) {
+    // 未移动的单击不应产生脏数据
+    const a = state.anns.find((z) => z.uid === d.uid);
+    if (a && d.mode === 'move') a.bbox = d.orig;
+    render();
+  }
+}
+wrap.addEventListener('pointerup', endDrag);
+wrap.addEventListener('pointercancel', endDrag);
+wrap.addEventListener('pointerleave', () => { cursorPos = null; renderOverlay(); });
+
+/* ------------------------------ 快捷键 ------------------------------ */
+function isTyping(el) {
+  if (!el) return false;
+  const t = el.tagName;
+  return t === 'INPUT' || t === 'TEXTAREA' || t === 'SELECT' || el.isContentEditable;
+}
+document.addEventListener('keydown', (ev) => {
+  if (ev.key === 'Escape') {
+    if ($('help').classList.contains('show')) { $('help').classList.remove('show'); ev.preventDefault(); return; }
+    if (drag) { drag = null; wrap.classList.remove('panning'); render(); }
+    if (state.selectedId) { state.selectedId = null; renderAnnList(); render(); }
+    setTool('box');
+    return;
+  }
+  if (isTyping(ev.target)) return;
+  const k = ev.key;
+  // 空格用于平移；若焦点在按钮上则交给浏览器默认行为，避免误触
+  if (k === ' ') {
+    if (ev.target && ev.target.tagName === 'BUTTON') return;
+    spaceDown = true; wrap.style.cursor = 'grab'; ev.preventDefault(); return;
+  }
+
+  if (k >= '1' && k <= '9') {
+    const idx = Number(k) - 1;
+    if (state.activeClasses[idx]) setClass(state.activeClasses[idx].code);
+    ev.preventDefault(); return;
+  }
+  switch (k) {
+    case 'b': case 'B': setTool('box'); break;
+    case 'Delete': case 'Backspace': deleteSelected(); ev.preventDefault(); break;
+    case 'd': case 'D': goNext(); break;
+    case 'a': case 'A': goPrev(); break;
+    case 'c': case 'C': copyFromPrevious(); break;
+    case 'z': case 'Z': adoptAllCandidates(); break;
+    case 's': case 'S': saveAndSubmit(); break;
+    case 'q': case 'Q': zoomAt(cv.w / 2, cv.h / 2, 1 / 1.2); break;
+    case 'e': case 'E': zoomAt(cv.w / 2, cv.h / 2, 1.2); break;
+    case '?': case '/': $('help').classList.toggle('show'); break;
+    default: return;
+  }
+  ev.preventDefault();
+});
+document.addEventListener('keyup', (ev) => {
+  if (ev.key === ' ') { spaceDown = false; wrap.style.cursor = ''; }
+});
+// 关闭页面前兜底保存草稿
+window.addEventListener('beforeunload', () => { if (state.dirty) saveDraft(true); });
+// 失焦时释放空格状态，避免卡在平移模式
+window.addEventListener('blur', () => { spaceDown = false; });
+
+/* ------------------------------ 工具栏与状态栏 ------------------------------ */
+function setTool(t) {
+  tool = t;
+  $('btnToolBox').classList.toggle('on', t === 'box');
+  $('btnToolSelect').classList.toggle('on', t === 'select');
+  $('toolHint').textContent = t === 'box' ? '左键在空白处拖拽即可新建框' : '左键选择 / 拖动框，拖手柄缩放';
+  render();
+}
+function updateStatus() {
+  $('stIdx').textContent = state.task
+    ? (state.curIndex >= 0 ? (state.curIndex + 1) + '/' + state.queue.length : '—') + '（#' + state.task.id + '）'
+    : '—';
+  $('stZoom').textContent = state.imgLoaded ? Math.round(state.view.scale * 100) + '%' : '—';
+  $('zoomText').textContent = state.imgLoaded ? Math.round(state.view.scale * 100) + '%' : '—';
+  $('stClass').textContent = state.curClassCode ? className(state.curClassCode) : '—';
+  $('stAnn').textContent = String(state.anns.length);
+  $('metaTask').textContent = state.task ? '任务 #' + state.task.id + '（' + (STATUS_ZH[state.task.status] || state.task.status || '—') + '）' : '任务 —';
+  $('metaImg').textContent = state.task
+    ? '影像 ' + state.task.image_id + (state.imgLoaded ? ' · ' + state.imgW + '×' + state.imgH : '')
+    : '影像 —';
+  $('btnSave').disabled = !state.task || state.busy;
+  $('btnLease').disabled = state.busy;
+  $('btnSave').textContent = state.busy && state.task ? '处理中…' : 'S 保存并提交';
+}
+function updateCoord(sx, sy) {
+  if (!state.imgLoaded) { $('stCoord').textContent = '—'; return; }
+  const [nx, ny] = screenToNorm(sx, sy);
+  const inside = nx >= 0 && nx <= 1 && ny >= 0 && ny <= 1;
+  const label = inside ? '✓' : '·';
+  $('stCoord').textContent = label + ' 归一化 ' + nx.toFixed(4) + ', ' + ny.toFixed(4) +
+    ' ｜ px ' + Math.round(nx * state.imgW) + ', ' + Math.round(ny * state.imgH);
+}
+wrap.addEventListener('pointermove', (ev) => { const [x, y] = localPoint(ev); updateCoord(x, y); });
+
+/* ------------------------------ 事件绑定 ------------------------------ */
+$('btnLease').onclick = leaseTask;
+$('btnRefresh').onclick = () => loadQueue();
+$('filterStatus').onchange = renderQueue;
+$('btnSave').onclick = saveAndSubmit;
+$('btnHelp').onclick = () => $('help').classList.toggle('show');
+$('btnHelpClose').onclick = () => $('help').classList.remove('show');
+$('help').onclick = (ev) => { if (ev.target === $('help')) $('help').classList.remove('show'); };
+$('btnToolBox').onclick = () => setTool('box');
+$('btnToolSelect').onclick = () => setTool('select');
+$('btnFit').onclick = fitView;
+$('btnZoomIn').onclick = () => zoomAt(cv.w / 2, cv.h / 2, 1.2);
+$('btnZoomOut').onclick = () => zoomAt(cv.w / 2, cv.h / 2, 1 / 1.2);
+$('btnAdoptAll').onclick = adoptAllCandidates;
+$('rangeBright').oninput = (ev) => { state.bright = Number(ev.target.value); $('brightVal').textContent = ev.target.value; renderImage(); };
+$('rangeContrast').oninput = (ev) => { state.contrast = Number(ev.target.value); $('contrastVal').textContent = ev.target.value; renderImage(); };
+$('btnResetBC').onclick = () => {
+  state.bright = 0; state.contrast = 0;
+  $('rangeBright').value = '0'; $('rangeContrast').value = '0';
+  $('brightVal').textContent = '0'; $('contrastVal').textContent = '0';
+  renderImage();
+};
+window.addEventListener('resize', resizeCanvas);
+if (window.ResizeObserver) new ResizeObserver(() => resizeCanvas()).observe(wrap);
+
+/* ------------------------------ 启动 ------------------------------ */
+(async function boot() {
+  resizeCanvas();
+  setTool('box');
+  renderAnnList();
+  renderQueue();
+  updateStatus();
+  await probeHealth();
+  await loadClasses();
+  await loadQueue();
+  if (!state.task) {
+    const q = $('queueList');
+    if (!state.queue.length && q.querySelector('.empty')) {
+      $('hint').style.display = 'block';
+    }
+  }
+  setSaveStatus('空闲');
+})();
+</script>
+</body>
+</html>

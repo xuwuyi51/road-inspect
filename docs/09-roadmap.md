@@ -6,8 +6,8 @@
 
 | 里程碑 | 目标 | 主要产出 | 预估工作量 | 依赖 |
 |---|---|---|---|---|
-| **M0 文档与骨架（本次）** | 设计定稿、可评审 | 本 docs 全集、`db/schema.sql`、`openapi.yaml`、格式样例 | 1–2 人日 | — |
-| **M1 采集与标注闭环** | 能导入、能标、能导出 | FastAPI 服务、SQLite 仓储、导入管线（EXIF/抽帧/切片/去重）、标注台、三格式导出 | 8–12 人日 | M0 |
+| **M0 文档与骨架 ✅** | 设计定稿、可评审 | 本 docs 全集、`db/schema.sql`、`openapi.yaml`、格式样例 | 1–2 人日 | — |
+| **M1 采集与标注闭环 ✅** | 能导入、能标、能导出 | FastAPI 服务、SQLite 仓储、导入管线（EXIF/抽帧/切片/去重）、标注台、三格式导出 | 8–12 人日 | M0 |
 | **M2 模型辅助标注** | 机器先打草稿 | 预标注服务（YOLO11 + SAHI）、SAM 掩膜辅助、候选采纳/忽略、来源标记 | 5–8 人日 | M1 |
 | **M3 训练闭环与门禁** | 小样本训练出可用权重 | 数据集冻结、训练/评估 runner、分类别指标与混淆矩阵、门禁、ONNX 导出 | 6–9 人日 | M1 |
 | **M4 边缘离线推理** | 车载/巡检无网可用 | `rdinspect infer` CLI、导出包格式、JSONL/CSV 输出、性能达标 | 4–6 人日 | M3 |
@@ -17,7 +17,14 @@
 
 ## 2. 各里程碑任务分解
 
-### M1 采集与标注闭环（8–12 人日）
+### M1 采集与标注闭环 ✅（已完成，验收结果见 README「测试」）
+
+**实现与验收摘要**
+- 代码：`src/rdinspect/{config,cli,errors}.py`、`storage/{db,files,repo}.py`、`core/{hashing,geometry,images,ingest,formats,datasets}.py`、`api/app.py` + `api/static/index.html`（单文件标注台）。
+- 测试：44 项单测 + 端到端验收（500 张合成照片 + 1 段视频 → 导入 → 四类各 50 张标注复核 → 冻结导出 → 三格式往返零误差 → 清单哈希可复现）。
+- 与设计的两处一致偏差：① 标注台为单文件原生 Canvas（非 Vite+React+Konva），零构建零外部依赖；② 预标注/训练端点返回 501（属 M2/M3）。
+
+#### 原始任务分解（8–12 人日）
 1. 工程骨架：`pyproject.toml`、`src/rdinspect/{api,core,storage,cli}`、配置加载、日志、`systemd --user` 单元。
 2. 存储层：`schema.sql` 落地、仓储 API（事务/原子写/迁移 runner）、SQLite WAL 参数。
 3. 导入管线：EXIF 解析、SHA256/pHash 去重、视频抽帧（ffmpeg）、航拍切片、批次统计与失败清单。
