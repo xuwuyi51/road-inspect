@@ -21,6 +21,9 @@ from ..config import Config, ConfigError, load_config
 from ..core import datasets as datasets_mod
 from ..core.ingest import import_path
 from ..errors import ConflictError, NotFoundError
+from ..prelabel.detector import DetectorUnavailable
+from ..prelabel.metrics import prelabel_metrics
+from ..prelabel.service import attach_mask_for_annotation, build_detector, prelabel_tasks
 from ..storage.db import init_db
 from ..storage.repo import Repo
 
@@ -104,15 +107,46 @@ class DatasetDraftRequest(BaseModel):
     split: dict[str, Any] = Field(default_factory=dict)
 
 
+class PrelabelBatchRequest(BaseModel):
+    limit: int = Field(ge=1, le=1000, default=50)
+    status: str = "pending"
+    model: str | None = None
+    conf: float | None = None
+    iou: float | None = None
+    sam: bool | None = None
+    sam_limit: int = Field(ge=0, le=20, default=2)
+
+
 class DatasetExportRequest(BaseModel):
     formats: list[str] = Field(default_factory=lambda: ["yolo", "coco", "labelme"])
     copy_images: bool = True
 
 
 # ─────────────────────────── 应用工厂 ───────────────────────────
-def create_app(config: Config | None = None) -> FastAPI:
+def create_app(config: Config | None = None, *, detector_factory=None,
+               masker_factory=None) -> FastAPI:
+    """构建应用。
+
+    @param config - 运行期配置（默认读 configs/default.yaml）
+    @param detector_factory - 可注入的检测器工厂 `(config, weights) -> Detector`；
+                              默认用 ultralytics 适配器，测试可注入假实现（无需 ML 依赖）
+    @param masker_factory  - 可注入的掩膜器工厂 `(config) -> SamMasker`
+    """
     cfg = config or load_config()
     cfg.ensure_dirs()
+
+    def make_detector(weights: str, conf: float | None = None, iou: float | None = None):
+        if detector_factory is not None:
+            return detector_factory(cfg, weights)
+        return build_detector(cfg, weights, conf=conf, iou=iou)
+
+    def make_masker():
+        if masker_factory is not None:
+            return masker_factory(cfg)
+        from ..prelabel.sam import SamMasker  # 局部导入：未安装 ML 依赖时不在导入期失败
+        from ..prelabel.service import _localize_weights  # noqa: PLC0415
+
+        return SamMasker(_localize_weights(cfg, cfg.prelabel.sam.model), device=cfg.prelabel.device)
 
     app = FastAPI(title="road-inspect", version="0.1.0",
                   description="轻量级道路灾害巡查：采集 → 标注 → 复核 → 数据集冻结与导出")
@@ -297,6 +331,98 @@ def create_app(config: Config | None = None) -> FastAPI:
         except Exception as exc:  # noqa: BLE001
             raise handle(exc) from exc
         return {"task": repo.get_task(task_id), "review": review}
+
+    # ── 预标注（M2：模型辅助标注）──
+
+    def _prelabel_deps(payload: "PrelabelBatchRequest", repo: Repo) -> tuple[object | None, object | None]:
+        """仅当测试注入了工厂时提前构造检测器/掩膜器；否则交回 service 自行解析权重。"""
+        from ..prelabel.service import resolve_weights  # noqa: PLC0415
+
+        detector = None
+        masker = None
+        if detector_factory is not None:
+            weights = payload.model or resolve_weights(cfg, repo, payload.model)
+            detector = make_detector(weights, conf=payload.conf, iou=payload.iou)
+        if masker_factory is not None:
+            masker = make_masker()
+        return detector, masker
+
+    @app.post("/api/tasks/{task_id}/prelabel")
+    def prelabel_task(task_id: int, payload: PrelabelBatchRequest | None = None,
+                      repo: Repo = Depends(repo_dependency)) -> dict[str, Any]:
+        options = payload or PrelabelBatchRequest(limit=1)
+        detector, masker = _prelabel_deps(options, repo)
+        try:
+            report = prelabel_tasks(cfg, repo, limit=1, task_ids=[task_id],
+                                    model=options.model, conf=options.conf, iou=options.iou,
+                                    sam=options.sam, sam_limit=options.sam_limit, actor="api",
+                                    detector=detector, masker=masker)
+        except DetectorUnavailable as exc:
+            raise HTTPException(status_code=501, detail=str(exc)) from exc
+        return report.as_dict() | {"task_id": task_id}
+
+    @app.post("/api/prelabel/batches")
+    def prelabel_batch(payload: PrelabelBatchRequest, repo: Repo = Depends(repo_dependency)) -> dict[str, Any]:
+        detector, masker = _prelabel_deps(payload, repo)
+        try:
+            report = prelabel_tasks(cfg, repo, limit=payload.limit, status=payload.status,
+                                    model=payload.model, conf=payload.conf, iou=payload.iou,
+                                    sam=payload.sam, sam_limit=payload.sam_limit, actor="api",
+                                    detector=detector, masker=masker)
+        except DetectorUnavailable as exc:
+            raise HTTPException(status_code=501, detail=str(exc)) from exc
+        run = repo.get_run(report.run_id) if report.run_id else None
+        return {"run": run, "requested": report.requested, "report": report.as_dict()}
+
+    @app.get("/api/prelabel/metrics")
+    def prelabel_quality(repo: Repo = Depends(repo_dependency)) -> dict[str, Any]:
+        return prelabel_metrics(repo)
+
+    # ── 标注删除 / 掩膜辅助 ──
+    @app.delete("/api/annotations/{annotation_id}")
+    def delete_annotation(annotation_id: int, repo: Repo = Depends(repo_dependency)) -> dict[str, Any]:
+        deleted = repo.delete_annotation(annotation_id, actor="api")
+        if not deleted:
+            raise HTTPException(status_code=404, detail=f"标注 {annotation_id} 不存在或已删除")
+        return {"deleted": True, "id": annotation_id}
+
+    @app.post("/api/annotations/{annotation_id}/mask")
+    def create_mask(annotation_id: int, repo: Repo = Depends(repo_dependency)) -> dict[str, Any]:
+        try:
+            masker = make_masker() if masker_factory is not None else None
+            return attach_mask_for_annotation(cfg, repo, annotation_id, masker=masker)
+        except DetectorUnavailable as exc:
+            raise HTTPException(status_code=501, detail=str(exc)) from exc
+        except (KeyError, ValueError) as exc:
+            raise handle(exc) from exc
+
+    @app.get("/api/annotations/{annotation_id}/mask")
+    def get_mask(annotation_id: int, repo: Repo = Depends(repo_dependency)) -> FileResponse:
+        row = repo.conn.execute("SELECT mask_path FROM annotations WHERE id = ?", (annotation_id,)).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail=f"标注 {annotation_id} 不存在")
+        mask_path = row["mask_path"]
+        if not mask_path:
+            # 便捷回退：用「框标注 id」查询时，返回同任务同类最新掩膜（标注台流程用得到）
+            fallback = repo.conn.execute(
+                """SELECT a.mask_path FROM annotations a
+                   JOIN annotations src ON src.id = ?
+                   WHERE a.kind = 'mask' AND a.deleted_at IS NULL AND a.task_id = src.task_id
+                     AND a.class_code = src.class_code AND a.mask_path IS NOT NULL
+                   ORDER BY a.id DESC LIMIT 1""", (annotation_id,)).fetchone()
+            mask_path = fallback["mask_path"] if fallback is not None else None
+        if not mask_path:
+            raise HTTPException(status_code=404, detail=f"标注 {annotation_id} 没有掩膜")
+        path = cfg.abs_data_path(mask_path)
+        if not path.exists():
+            raise HTTPException(status_code=410, detail="掩膜文件已丢失")
+        return FileResponse(path, media_type="image/png")
+
+    # ── 模型注册表（M2：登记预标注权重）──
+    @app.get("/api/models")
+    def list_models(status: str | None = None, task: str | None = None,
+                    repo: Repo = Depends(repo_dependency)) -> list[dict[str, Any]]:
+        return repo.list_model_versions(task=task, status=status)
 
     # ── 数据集 ──
     @app.get("/api/datasets")

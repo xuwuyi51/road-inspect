@@ -116,6 +116,13 @@ main{flex:1;display:grid;grid-template-columns:288px minmax(0,1fr) 320px;min-hei
 .src.model{color:#fcd34d;border-color:#a16207}
 .src.human{color:#6ee7b7;border-color:#047857}
 .src.model_edited{color:#93c5fd;border-color:#1d4ed8}
+/* 候选条目的行内小按钮：紧凑，不改变原有「色块 + 文本」布局（作为行的第三个 flex 子项） */
+.ann .acts{display:flex;gap:3px;align-items:center;flex:0 0 auto;margin-left:2px}
+.ann .mini{padding:0 5px;font-size:10px;line-height:15px;border-radius:3px;background:#334155;border-color:var(--line2)}
+.ann .mini:hover{background:#465063}
+.ann .mini.adopt{color:#bfdbfe;border-color:#1d4ed8}
+.ann .mini.ignore{color:#fca5a5;border-color:#b91c1c}
+.ann .l2{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 #classBar{display:flex;flex-wrap:wrap;gap:4px;padding:6px 8px}
 .cls{
   display:flex;align-items:center;gap:5px;padding:3px 7px;border-radius:4px;cursor:pointer;
@@ -138,6 +145,18 @@ kbd{
   background:#111827;border:1px solid var(--line2);border-bottom-width:2px;border-radius:3px;
   padding:0 4px;font-size:10px;font-family:inherit;color:var(--text)
 }
+
+/* ========================== 预标注质量面板（右上，可折叠） ========================== */
+#metrics{flex:0 0 auto;background:var(--panel);border-bottom:1px solid var(--line);font-size:11px}
+#metrics .hd{display:flex;align-items:center;gap:5px;padding:4px 8px;background:#1b2537;cursor:pointer}
+#metrics .hd h3{margin:0;font-size:11px;font-weight:600;color:var(--muted);letter-spacing:.4px;flex:1}
+#metrics .hd .cv{color:var(--dim);font-size:10px;width:9px;text-align:center}
+#metrics .hd .mini{padding:0 4px;line-height:14px}
+#metrics .bd{padding:3px 8px 6px}
+#metrics.collapsed .bd{display:none}
+#metrics .row{display:flex;align-items:center;gap:8px;padding:1px 0}
+#metrics .row .k{flex:1;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#metrics .row .v{font-variant-numeric:tabular-nums}
 
 /* ============================== 快捷键面板 ============================== */
 #help{
@@ -173,6 +192,8 @@ kbd{
     </span>
     <span class="spread"></span>
     <button id="btnHelp" class="ghost" title="快捷键（?）">? 快捷键</button>
+    <button id="btnPrelabel" class="ghost" title="对当前影像运行模型预标注，刷新候选">预标注本图</button>
+    <button id="btnBatchPrelabel" class="ghost" title="对一批待标注任务排队预标注">批量预标注</button>
     <button id="btnRefresh" class="ghost">刷新队列</button>
     <button id="btnSave" class="primary" disabled>S 保存并提交</button>
   </header>
@@ -232,6 +253,22 @@ kbd{
 
     <!-- ========================= 右栏：标注列表 + 类别条 ========================= -->
     <section class="col" id="colRight">
+      <!-- 预标注质量（可折叠）：置于右栏顶部，避免遮挡标注列表与顶部提示条 -->
+      <div id="metrics">
+        <div class="hd" id="metricsHead" title="点击折叠 / 展开">
+          <h3>预标注质量</h3>
+          <button id="btnMetricsRefresh" class="mini" title="重新加载指标">⟳</button>
+          <span class="cv" id="metricsCaret">▾</span>
+        </div>
+        <div class="bd" id="metricsBody">
+          <div class="row"><span class="k">已预标注任务</span><span class="v" id="mTasks">—</span></div>
+          <div class="row"><span class="k">候选总数</span><span class="v" id="mCand">—</span></div>
+          <div class="row"><span class="k">已采纳</span><span class="v" id="mAdopt">—</span></div>
+          <div class="row"><span class="k">已忽略</span><span class="v" id="mIgnore">—</span></div>
+          <div class="row"><span class="k">采纳率</span><span class="v" id="mRate">—</span></div>
+          <div class="row"><span class="k" title="模型与人工框的平均 IoU">模型-人工 IoU</span><span class="v" id="mIou">—</span></div>
+        </div>
+      </div>
       <div class="sec">
         <h2>当前图标注</h2>
         <span class="spread"></span>
@@ -334,7 +371,10 @@ const state = {
   bright: 0, contrast: 0,
   dirty: false,           // 是否有未保存改动
   busy: false,            // 正在请求（防止重复提交）
+  prelabelBusy: false,    // 预标注请求进行中（禁用两个预标注按钮）
   annSeq: 1,              // 本地 uid 生成器
+  candidateIds: new Set(),// 服务端仍是未处理候选（source=model）的标注 id，用于区分「本地刚采纳」与「已落库的 model_edited」
+  prelabelPollSeq: 0,     // 预标注候选轮询序号（重新预标注/切换任务后作废旧定时器）
   cache: new Map()        // image_id → 标注快照，用于 C「复制上一张」
 };
 
@@ -628,7 +668,10 @@ async function api(path, options) {
   if (!res.ok) {
     const code = data && data.code ? data.code : res.status;
     const msg = data && data.message ? data.message : (text ? text.slice(0, 200) : res.statusText);
-    throw new Error('接口 ' + path + ' 失败（' + res.status + ' ' + code + '）：' + msg);
+    const err = new Error('接口 ' + path + ' 失败（' + res.status + ' ' + code + '）：' + msg);
+    err.status = res.status;   // 供调用方区分 501（未安装 ML 依赖）等状态，message 保持原样
+    err.code = code;
+    throw err;
   }
   return data;
 }
@@ -640,8 +683,20 @@ const API = {
   task: (id) => api('/api/tasks/' + encodeURIComponent(id)),
   putAnnotations: (id, anns) => api('/api/tasks/' + encodeURIComponent(id) + '/annotations', { method: 'PUT', body: { annotations: anns } }),
   submit: (id) => api('/api/tasks/' + encodeURIComponent(id) + '/submit', { method: 'POST' }),
-  imageFileUrl: (imageId) => '/api/images/' + encodeURIComponent(imageId) + '/file'
+  imageFileUrl: (imageId) => '/api/images/' + encodeURIComponent(imageId) + '/file',
+  // ── 模型辅助标注（预标注）──
+  prelabel: (id) => api('/api/tasks/' + encodeURIComponent(id) + '/prelabel', { method: 'POST' }),
+  prelabelBatch: (body) => api('/api/prelabel/batches', { method: 'POST', body }),
+  deleteAnnotation: (id) => api('/api/annotations/' + encodeURIComponent(id), { method: 'DELETE' }),
+  prelabelMetrics: () => api('/api/prelabel/metrics')
 };
+/** 后端未安装 torch/ultralytics 时所有预标注端点返回 501，统一提示这条命令 */
+const ML_MISSING_HINT = "未安装 ML 依赖：用 .venv/bin/pip install -e '.[ml]' 安装后重试";
+/** 501（未安装 ML 依赖）走专用提示，其余错误带接口信息走顶部提示条 */
+function reportPrelabelError(prefix, e) {
+  if (e && e.status === 501) banner(ML_MISSING_HINT, 'error', true);
+  else banner(prefix + '：' + (e && e.message ? e.message : e), 'error', true);
+}
 
 /* ------------------------------ 启动探测 ------------------------------ */
 async function probeHealth() {
@@ -820,16 +875,23 @@ function fromServer(a) {
     source: src, score: num(a.score), difficult: !!a.difficult, color: classColor(a.class_code)
   };
 }
-/** 本地结构 → PUT /annotations 的契约载荷（坐标裁剪到 [0,1]） */
+/** 本地结构 → PUT /annotations 的契约载荷（坐标裁剪到 [0,1]）
+ *  注意后端语义（repo.replace_annotations 以 include_model=False 取当前集）：模型候选行不受 PUT 管理，
+ *  故未处理的候选（source==='model'）必须排除在载荷之外，否则会被当成新增人工框重复写入；
+ *  已采纳的候选带 source='model_edited' 提交，保住来源可追溯性。 */
 function toPayload(anns) {
-  return anns.map((a) => ({
-    class_code: a.class_code, kind: 'bbox',
-    bbox: {
-      x1: clamp(a.bbox.x1, 0, 1), y1: clamp(a.bbox.y1, 0, 1),
-      x2: clamp(a.bbox.x2, 0, 1), y2: clamp(a.bbox.y2, 0, 1)
-    },
-    difficult: !!a.difficult
-  }));
+  return anns.filter((a) => a.source !== 'model').map((a) => {
+    const item = {
+      class_code: a.class_code, kind: 'bbox',
+      bbox: {
+        x1: clamp(a.bbox.x1, 0, 1), y1: clamp(a.bbox.y1, 0, 1),
+        x2: clamp(a.bbox.x2, 0, 1), y2: clamp(a.bbox.y2, 0, 1)
+      },
+      difficult: !!a.difficult
+    };
+    if (a.source === 'model_edited') item.source = 'model_edited';
+    return item;
+  });
 }
 
 /** 打开任务：GET /api/tasks/{id}，处理草稿询问与旧图草稿落盘 */
@@ -849,6 +911,7 @@ async function openTask(t) {
     state.task = detail;
     state.curIndex = queueIndexById(t.id);
     state.anns = (detail.annotations || []).map(fromServer);
+    syncCandidateIds(detail.annotations);   // 记录服务端仍是候选的行（采纳落库时用于对齐）
     // 记录来源快照，用于 C「复制上一张图标注」
     if (detail.image_id !== undefined && detail.image_id !== null) {
       state.cache.set(String(detail.image_id), serializeAnns(state.anns));
@@ -973,10 +1036,28 @@ function renderAnnList() {
           a.bbox.x1.toFixed(3) + ',' + a.bbox.y1.toFixed(3) + ' → ' + a.bbox.x2.toFixed(3) + ',' + a.bbox.y2.toFixed(3) +
         '</div>' +
       '</div>';
+    if (a.source === 'model') el.appendChild(candidateActions(a));
     el.onclick = () => { selectAnn(a.uid, false); };
     el.ondblclick = () => { selectAnn(a.uid, false); focusBox(a.bbox, 0.6); };
     box.appendChild(el);
   });
+}
+/** 候选行的行内动作按钮（采纳 / 忽略）：小尺寸，作为 .ann 的第三个 flex 子项，不影响原布局 */
+function candidateActions(a) {
+  const acts = document.createElement('span');
+  acts.className = 'acts';
+  acts.appendChild(miniBtn('采纳', 'adopt', '采纳该候选（等同 Z 的单条版本，保存时写入）', () => adoptCandidate(a.uid)));
+  acts.appendChild(miniBtn('忽略', 'ignore', '忽略该候选（DELETE /api/annotations）', () => ignoreCandidate(a.uid)));
+  return acts;
+}
+function miniBtn(label, act, title, fn) {
+  const b = document.createElement('button');
+  b.className = 'mini ' + act;
+  b.dataset.act = act;
+  b.textContent = label;
+  b.title = title;
+  b.onclick = (ev) => { if (ev && ev.stopPropagation) ev.stopPropagation(); fn(); };
+  return b;
 }
 function selectAnn(uid, scrollList) {
   state.selectedId = uid;
@@ -1017,10 +1098,12 @@ async function saveAndSubmit() {
   setSaveStatus('保存中…');
   const taskId = state.task.id;
   try {
+    await reconcileAdoptedCandidates();   // 已采纳候选先与后端对齐（避免重复行），再全量提交
     const r = await API.putAnnotations(taskId, toPayload(state.anns));
     // 用服务端返回（含 id / 推导出的 source）刷新本地
     if (r && Array.isArray(r.annotations)) {
       state.anns = r.annotations.map(fromServer);
+      syncCandidateIds(r.annotations);
       renderAnnList();
     }
     state.dirty = false;
@@ -1034,6 +1117,7 @@ async function saveAndSubmit() {
     setSaveStatus('已提交');
     toast('任务 #' + taskId + ' 已保存并提交进入复核');
     renderQueue();
+    loadMetrics();        // 采纳/忽略在保存后落库，刷新质量看板
     const next = nextTaskRef();
     if (next) await openTask(next);
   } catch (e) {
@@ -1049,8 +1133,9 @@ async function saveAndSubmit() {
 /** 仅保存（不提交），用于内部草稿归档 */
 async function saveOnly() {
   if (!state.task) return 0;
+  await reconcileAdoptedCandidates();
   const r = await API.putAnnotations(state.task.id, toPayload(state.anns));
-  if (r && Array.isArray(r.annotations)) { state.anns = r.annotations.map(fromServer); renderAnnList(); }
+  if (r && Array.isArray(r.annotations)) { state.anns = r.annotations.map(fromServer); syncCandidateIds(r.annotations); renderAnnList(); }
   state.dirty = false;
   clearDraft(state.task.id);
   setSaveStatus('已保存');
@@ -1099,15 +1184,190 @@ function copyFromPrevious() {
   markDirty(); renderAnnList(); render();
   toast('已从 ' + from + ' 复制 ' + src.length + ' 个标注（请按需修正）');
 }
-/** Z：采纳全部模型候选（source=model → model_edited） */
-function adoptAllCandidates() {
+/** 采纳流转（Z 与候选行「采纳」按钮共用）：source model → model_edited，保存时落库 */
+function adoptCandidates(list) {
   let n = 0;
-  for (const a of state.anns) {
-    if (a.source === 'model') { a.source = 'model_edited'; n++; }
-  }
+  for (const a of list) { if (a.source === 'model') { a.source = 'model_edited'; n++; } }
+  return n;
+}
+/** Z：采纳全部模型候选（语义与原来一致，改为走共用流转函数） */
+function adoptAllCandidates() {
+  const n = adoptCandidates(state.anns);
   if (!n) { toast('当前图没有未采纳的模型候选'); return; }
   markDirty(); renderAnnList(); render();
   toast('已采纳 ' + n + ' 个模型候选，可继续调整');
+  loadMetrics();
+}
+/** 单条「采纳」：与 Z 完全相同的流转，只是作用范围为该条；仍由 S 保存写入（source=model_edited） */
+function adoptCandidate(uid) {
+  const a = state.anns.find((x) => x.uid === uid);
+  if (!a) return;
+  if (!adoptCandidates([a])) return;
+  markDirty(); renderAnnList(); render();
+  toast('已采纳该模型候选（保存时写入）');
+  loadMetrics();
+}
+/** 单条「忽略」：DELETE /api/annotations/{id} → 从本地状态与画布移除；失败保留候选并走顶部提示条 */
+async function ignoreCandidate(uid) {
+  const a = state.anns.find((x) => x.uid === uid);
+  if (!a) return;
+  const id = a.id;
+  if (id !== null && id !== undefined) {
+    try {
+      await API.deleteAnnotation(id);
+    } catch (e) {
+      // 404 = 服务端已不存在（例如被别处删除/草稿恢复出的陈旧候选）：按已忽略处理，避免残留无法清理
+      if (!e || e.status !== 404) {
+        banner('忽略候选失败：' + e.message, 'error', true);
+        return;   // 失败时不本地删除，避免「界面上没了、服务端还在」的不一致
+      }
+    }
+  }
+  const i = state.anns.findIndex((x) => x.uid === uid);
+  if (i >= 0) state.anns.splice(i, 1);
+  if (id !== null && id !== undefined) state.candidateIds.delete(id);
+  if (state.selectedId === uid) state.selectedId = null;
+  renderAnnList(); render(); updateStatus();
+  toast('已忽略模型候选');
+  loadMetrics();
+}
+
+/* ---------------------- 模型辅助标注（预标注） ---------------------- */
+/** 运行 id 兼容两种返回形态：{"run":{"id":..}}（契约/批量）与 {"run_id":..}（服务端 report 直出） */
+function runIdOf(r) {
+  if (!r) return null;
+  if (r.run && r.run.id !== undefined && r.run.id !== null) return r.run.id;
+  if (r.run_id !== undefined && r.run_id !== null) return r.run_id;
+  return null;
+}
+/** 顶栏「预标注本图」：POST /api/tasks/{id}/prelabel → GET /api/tasks/{id} 刷新候选 */
+async function prelabelCurrentTask() {
+  if (!state.task) { toast('请先在左栏选择任务'); return; }
+  if (state.prelabelBusy) return;
+  const taskId = state.task.id;
+  state.prelabelBusy = true; updateStatus();
+  try {
+    const r = await API.prelabel(taskId);
+    const runId = runIdOf(r);
+    const candN = r && typeof r.candidates === 'number' ? r.candidates : null;
+    // 同步实现（本服务端就地执行）与异步 run（契约里的 status=running）都能给出合理提示
+    toast((candN === null ? '已提交预标注任务' : '预标注已完成') + '：run #' + (runId === null ? '?' : runId) +
+      '（任务 #' + taskId + (candN === null ? '' : '，候选 ' + candN + ' 个') + '）');
+    const added = await refreshCandidates(taskId);
+    if (!added) scheduleCandidateRefresh(taskId, [2500, 6000, 12000]);  // 异步 run：稍后自动补刷候选
+    loadMetrics();
+  } catch (e) {
+    reportPrelabelError('预标注失败', e);
+  } finally {
+    state.prelabelBusy = false; updateStatus();
+  }
+}
+/** 顶栏「批量预标注」：POST /api/prelabel/batches（confirm 确认，默认 20 张 pending） */
+async function batchPrelabel() {
+  if (state.prelabelBusy) return;
+  if (!confirm('提交批量预标注任务？\n将对最多 20 个「待标注」任务排队执行模型预标注。')) return;
+  state.prelabelBusy = true; updateStatus();
+  try {
+    const r = await API.prelabelBatch({ limit: 20, status: 'pending' });
+    const runId = runIdOf(r);
+    const n = r && r.requested !== undefined && r.requested !== null ? r.requested : 0;
+    toast('已提交预标注任务：run #' + (runId === null ? '?' : runId) + '，共 ' + n + ' 张');
+    loadMetrics();
+  } catch (e) {
+    reportPrelabelError('批量预标注失败', e);
+  } finally {
+    state.prelabelBusy = false; updateStatus();
+  }
+}
+/** GET /api/tasks/{id}：只合并新增候选并同步任务状态，画布上未保存的本地改动保持不变 */
+async function refreshCandidates(taskId) {
+  const detail = await API.task(taskId);
+  if (!state.task || String(state.task.id) !== String(taskId)) return 0;
+  syncCandidateIds(detail.annotations);   // 服务端为准：本地刚采纳但服务端仍是 model 的行仍在集合里
+  if (detail.status) state.task.status = detail.status;
+  if (detail.prelabel_state !== undefined) state.task.prelabel_state = detail.prelabel_state;
+  const cur = state.queue.find((t) => String(t.id) === String(taskId));
+  if (cur && detail.status) cur.status = detail.status;
+  const key = (a) => [a.class_code, a.kind || 'bbox', Number(a.bbox.x1).toFixed(6), Number(a.bbox.y1).toFixed(6),
+                      Number(a.bbox.x2).toFixed(6), Number(a.bbox.y2).toFixed(6)].join('|');
+  const have = new Set(state.anns.map(key));
+  let added = 0;
+  for (const s of (detail.annotations || [])) {
+    if (s.source !== 'model') continue;   // 仅刷新候选；人工/已采纳的以本地（可能未保存）为准
+    const local = fromServer(s);
+    if (have.has(key(local))) continue;
+    state.anns.push(local); have.add(key(local)); added++;
+  }
+  if (added) { renderAnnList(); render(); }
+  renderQueue(); updateStatus();
+  return added;
+}
+/** 预标注是异步 run（status=running）：延迟做有限次补刷；再次预标注或切换任务后旧定时器自动作废 */
+function scheduleCandidateRefresh(taskId, delays) {
+  const seq = ++state.prelabelPollSeq;
+  (delays || []).forEach((ms) => {
+    setTimeout(async () => {
+      if (seq !== state.prelabelPollSeq) return;
+      if (!state.task || String(state.task.id) !== String(taskId)) return;
+      try {
+        if (await refreshCandidates(taskId)) loadMetrics();
+      } catch (e) { /* 补刷失败静默：首次刷新失败已由调用方提示 */ }
+    }, ms);
+  });
+}
+/** 采纳落库前的对齐：PUT 只维护非 model 行，直接提交同坐标的 model_edited 会新增一行并与原候选重复显示，
+ *  因此先把「本地刚采纳、服务端仍是 model」的候选行删除（软删），随后由 PUT 以 source=model_edited 重新写入。
+ *  已落库的 model_edited（id 不在 candidateIds 里）不受影响，避免二次保存误删。 */
+async function reconcileAdoptedCandidates() {
+  const adopted = state.anns.filter((a) => a.source === 'model_edited'
+    && a.id !== null && a.id !== undefined && state.candidateIds.has(a.id));
+  if (!adopted.length) return;
+  for (const a of adopted) {
+    try {
+      await API.deleteAnnotation(a.id);
+      state.candidateIds.delete(a.id);
+      a.id = null;
+    } catch (e) {
+      banner('候选 #' + a.id + ' 采纳落库失败：' + e.message + '（原候选行可能保留，可重试或用「忽略」清理）', 'error', true);
+    }
+  }
+}
+/** 以服务端返回的标注列表为准，重建「仍是候选」的 id 集合（只在拿到服务端数据后调用） */
+function syncCandidateIds(annotations) {
+  state.candidateIds = new Set((annotations || [])
+    .filter((a) => a.source === 'model' && a.id !== null && a.id !== undefined)
+    .map((a) => a.id));
+}
+
+/* ---------------------- 预标注质量看板 ---------------------- */
+/** null / undefined / 空串 / 非数值统一显示 —，避免出现 NaN */
+function isNilNum(v) {
+  if (v === null || v === undefined || v === '') return true;
+  return !isFinite(Number(v));
+}
+function mInt(v) { return isNilNum(v) ? '—' : String(Math.round(Number(v))); }
+function mPct(v) { return isNilNum(v) ? '—' : (Number(v) * 100).toFixed(1) + '%'; }
+function mFixed(v, d) { return isNilNum(v) ? '—' : Number(v).toFixed(d); }
+function renderMetrics(m) {
+  const d = m || {};
+  $('mTasks').textContent = mInt(d.tasks_prelabeled);
+  $('mCand').textContent = mInt(d.candidates_total);
+  $('mAdopt').textContent = mInt(d.adopted);
+  $('mIgnore').textContent = mInt(d.ignored);
+  $('mRate').textContent = mPct(d.adoption_rate);
+  $('mIou').textContent = mFixed(d.model_human_iou_mean, 2);
+}
+async function loadMetrics() {
+  try {
+    renderMetrics(await API.prelabelMetrics());
+  } catch (e) {
+    banner('预标注指标加载失败：' + e.message, 'warn', true);   // 被动刷新：用可关闭的提醒条，不遮挡操作
+  }
+}
+function toggleMetrics() {
+  const el = $('metrics');
+  el.classList.toggle('collapsed');
+  $('metricsCaret').textContent = el.classList.contains('collapsed') ? '▸' : '▾';
 }
 
 /* ------------------------------ 交互：指针 ------------------------------ */
@@ -1316,6 +1576,8 @@ function updateStatus() {
     : '影像 —';
   $('btnSave').disabled = !state.task || state.busy;
   $('btnLease').disabled = state.busy;
+  $('btnPrelabel').disabled = !state.task || state.busy || state.prelabelBusy;
+  $('btnBatchPrelabel').disabled = state.prelabelBusy;
   $('btnSave').textContent = state.busy && state.task ? '处理中…' : 'S 保存并提交';
 }
 function updateCoord(sx, sy) {
@@ -1331,6 +1593,10 @@ wrap.addEventListener('pointermove', (ev) => { const [x, y] = localPoint(ev); up
 /* ------------------------------ 事件绑定 ------------------------------ */
 $('btnLease').onclick = leaseTask;
 $('btnRefresh').onclick = () => loadQueue();
+$('btnPrelabel').onclick = prelabelCurrentTask;
+$('btnBatchPrelabel').onclick = batchPrelabel;
+$('metricsHead').onclick = toggleMetrics;
+$('btnMetricsRefresh').onclick = (ev) => { if (ev && ev.stopPropagation) ev.stopPropagation(); loadMetrics(); };
 $('filterStatus').onchange = renderQueue;
 $('btnSave').onclick = saveAndSubmit;
 $('btnHelp').onclick = () => $('help').classList.toggle('show');
@@ -1360,6 +1626,7 @@ if (window.ResizeObserver) new ResizeObserver(() => resizeCanvas()).observe(wrap
   renderAnnList();
   renderQueue();
   updateStatus();
+  loadMetrics();          // 打开页面加载一次质量看板
   await probeHealth();
   await loadClasses();
   await loadQueue();

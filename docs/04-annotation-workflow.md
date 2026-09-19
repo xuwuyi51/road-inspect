@@ -92,6 +92,17 @@ annotations(source='model', score=conf, model_version_id=...)  ──▶ 标注�
    生成"优先标注队列"（tasks.priority 提升）
 ```
 
+### 5.4 质量看板指标（`GET /api/prelabel/metrics` 与 `rdinspect prelabel-metrics`）
+
+| 指标 | 定义 | 用途 |
+|---|---|---|
+| `candidates_total` | `source='model'` 且未删除的候选数 | 待处理积压 |
+| `adopted` | `source='model_edited'`（含被人工微调替换后软删的原行） | 模型"曾被确认"的数量 |
+| `ignored` | `source='model'` 且已软删（标注台「忽略」） | 模型误检数量 |
+| `adoption_rate` | adopted / (adopted + ignored + candidates) | 模型可用性趋势；下降先于 mAP 下降出现 |
+| `model_human_iou_mean` | 同任务内模型原始提案与最终人工框按 IoU ≥ 0.1 贪心配对后的平均 IoU | 模型定位精度 |
+| `model_human_match_rate` | 已配对人工框 / 全部人工框 | 模型漏检的反向指标 |
+
 ## 6. 复核与质量管理
 
 | 机制 | 规则 |

@@ -59,6 +59,19 @@
 
 所有辅助模型均可关闭；关闭后标注台退化为纯人工，不影响流程。
 
+### 5.1 可直接使用的公开权重（M2 实测）
+
+| 用途 | 权重 | 来源 | 许可 | 实测 |
+|---|---|---|---|---|
+| 病害检测（冷启动） | `yolo12s_RDD2022_best.pt`（RDD2022 训练，5 类：D00/D10/D20/D40/Repair） | HF `rezzzq/yolo12s-road-damage-rdd2022` | MIT | 10 张真实路面图 → 17 个候选，映射率 89.5%（`Repair` 按设计丢弃） |
+| 通用检测（打通链路） | `yolo11n.pt`（COCO 80 类） | ultralytics assets | AGPL-3.0 | 仅验证适配器，类别会全部落入 `unmapped` |
+| 裂缝掩膜 | `sam2.1_t.pt` | ultralytics assets | Apache-2.0 | 裂缝候选 → 掩膜宽度 16.6/55.0 px，长度 251/299 px |
+
+> **下载提示（国内网络）**：GitHub 大文件直连常超时，可经镜像前缀加速，例如
+> `https://ghfast.top/https://github.com/ultralytics/assets/releases/download/v8.4.0/sam2.1_t.pt`；
+> HuggingFace 用 `https://hf-mirror.com/<repo>/resolve/main/<file>`。下载后放入 `data/weights/` 即可
+> （程序会把裸文件名权重解析到该目录，见 `prelabel/service.py:_localize_weights`）。
+
 ## 6. 评估协议与指标目标
 
 **评估对象**：冻结测试集（`dataset_versions.status='frozen'` 的 test 划分）。

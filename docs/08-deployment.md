@@ -53,6 +53,21 @@ WantedBy=default.target
 | 微调 YOLO11s 640 batch16 | 4–6 核 | < 8GB | < 14GB | 权重 + 日志 |
 | 边缘推理（CPU 4 线程） | 4 核 | < 500MB | 0 | — |
 
+### 1.4 模型辅助标注（M2）的依赖与目录
+
+```bash
+# CPU 版（约 1.6GB，适合预标注/单机验证；本机实测 200 张 640px 预标注 15.7s）
+.venv/bin/pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+.venv/bin/pip install ultralytics opencv-python-headless -i https://pypi.tuna.tsinghua.edu.cn/simple
+# GPU 版（本机有 RTX 5060 Ti 时更快）：把上面第一条换成
+#   .venv/bin/pip install torch torchvision --index-url https://download.pytorch.org/whl/cu130
+```
+
+- 权重放 `data/weights/`（裸文件名如 `yolo11n.pt` 会被解析到该目录，不会下载到进程 CWD）。
+- ultralytics/matplotlib 的配置目录被程序收进 `data/ultralytics`、`data/mpl`（`Config.export_runtime_env()` 设置
+  `YOLO_CONFIG_DIR`/`MPLCONFIGDIR`）；这样在受限文件系统（只读 home、容器）里也能导入 ultralytics。
+- 未安装 ML 依赖时：预标注端点返回 **501** 并给出安装命令，人工标注与数据集流程完全不受影响。
+
 ## 2. 形态二：边缘（车载/巡检，离线）
 
 | 项 | 方案 |

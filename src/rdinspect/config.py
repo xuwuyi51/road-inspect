@@ -53,6 +53,48 @@ class IngestConfig:
 
 
 @dataclass
+class TileInferConfig:
+    """推理侧切片参数（ADR-0006）：与导入期切片共用同一套几何。"""
+
+    enabled: object = "auto"      # True | False | "auto"（长边 > 1920 时启用）
+    size: int = 1024
+    overlap: float = 0.2
+    merge_iou: float = 0.5
+
+
+@dataclass
+class SamConfig:
+    enabled: bool = False
+    model: str = "sam2.1_t.pt"
+    min_box_side_px: int = 24
+
+
+@dataclass
+class PrelabelConfig:
+    """模型辅助标注配置（configs/prelabel.yaml）。"""
+
+    enabled: bool = True
+    model: str | None = None       # None → 使用 model_versions 中 status='production' 的权重
+    device: str = "auto"
+    imgsz: int = 640
+    conf: float = 0.25
+    iou: float = 0.5
+    max_detections: int = 100
+    tile: TileInferConfig = field(default_factory=TileInferConfig)
+    sam: SamConfig = field(default_factory=SamConfig)
+    #: 检测器类别名（或索引）→ 本项目类别 code 的别名表
+    class_aliases: dict[str, str] = field(default_factory=lambda: {
+        "d00": "longitudinal_crack", "d10": "transverse_crack",
+        "d20": "alligator_crack", "d40": "pothole", "d44": "pothole",
+        "longitudinal crack": "longitudinal_crack", "longitudinal_crack": "longitudinal_crack",
+        "transverse crack": "transverse_crack", "transverse_crack": "transverse_crack",
+        "alligator crack": "alligator_crack", "alligator_crack": "alligator_crack",
+        "pothole": "pothole", "manhole": "pothole",
+        "garbage": "garbage", "trash": "garbage", "debris": "garbage", "litter": "garbage",
+    })
+
+
+@dataclass
 class Config:
     """运行期配置（最小可用子集，未列出的键保留在 raw 中）。"""
 
@@ -63,6 +105,7 @@ class Config:
     allowed_roots: tuple[Path, ...] = ()
     thumb_long_edge: int = 512
     ingest: IngestConfig = field(default_factory=IngestConfig)
+    prelabel: PrelabelConfig = field(default_factory=PrelabelConfig)
     lease_seconds: int = 1800
     review_sample_ratio: float = 0.2
     config_path: Path | None = None
@@ -100,12 +143,36 @@ class Config:
     def logs_dir(self) -> Path:
         return self.data_dir / "logs"
 
+    @property
+    def weights_dir(self) -> Path:
+        """模型权重缓存目录（下载的 .pt 落在这里，而不是进程 CWD）。"""
+        return self.data_dir / "weights"
+
+    @property
+    def ultralytics_dir(self) -> Path:
+        """ultralytics 自身配置目录（默认会写 ~/.config/Ultralytics，被沙箱/生产环境拒绝）。"""
+        return self.data_dir / "ultralytics"
+
+    @property
+    def mpl_dir(self) -> Path:
+        """matplotlib 缓存目录（ultralytics 绘图会用到）。"""
+        return self.data_dir / "mpl"
+
+    def export_runtime_env(self) -> None:
+        """把第三方库的运行期目录收进 data_dir（幂等，不覆盖用户已显式设置的值）。"""
+        import os as _os
+
+        _os.environ.setdefault("YOLO_CONFIG_DIR", str(self.ultralytics_dir))
+        _os.environ.setdefault("MPLCONFIGDIR", str(self.mpl_dir))
+
     def ensure_dirs(self) -> None:
         for path in (
             self.data_dir, self.raw_dir, self.frames_dir, self.tiles_dir,
             self.thumbs_dir, self.masks_dir, self.datasets_dir, self.logs_dir,
+            self.weights_dir, self.ultralytics_dir, self.mpl_dir,
         ):
             path.mkdir(parents=True, exist_ok=True)
+        self.export_runtime_env()
 
     # ── 路径安全 ────────────────────────────────────────────────────────────
     def resolve_source(self, path: str | Path) -> Path:
@@ -186,8 +253,40 @@ def load_config(path: str | Path | None = None, *, data_dir: str | Path | None =
         max_batch_gb=float(ingest_raw.get("limits", {}).get("max_batch_gb", 2.0)),
     )
 
+    # 预标注配置：默认与 default.yaml 同目录的 prelabel.yaml（存在则合并，便于独立调参）
+    prelabel_raw = raw.get("prelabel")
+    if not isinstance(prelabel_raw, dict):
+        prelabel_path = config_path.parent / "prelabel.yaml"
+        prelabel_raw = yaml.safe_load(prelabel_path.read_text(encoding="utf-8")) if prelabel_path.exists() else {}
+    prelabel_raw = prelabel_raw or {}
+    tile_raw = prelabel_raw.get("tile") or {}
+    sam_raw = prelabel_raw.get("sam") or {}
+    prelabel = PrelabelConfig(
+        enabled=bool(prelabel_raw.get("enabled", True)),
+        model=(prelabel_raw.get("detector") or {}).get("model"),
+        device=str((prelabel_raw.get("detector") or {}).get("device", "auto")),
+        imgsz=int((prelabel_raw.get("detector") or {}).get("imgsz", 640)),
+        conf=float((prelabel_raw.get("detector") or {}).get("conf", 0.25)),
+        iou=float((prelabel_raw.get("detector") or {}).get("iou", 0.5)),
+        max_detections=int((prelabel_raw.get("detector") or {}).get("max_detections", 100)),
+        tile=TileInferConfig(
+            enabled=tile_raw.get("enabled", "auto"),
+            size=int(tile_raw.get("size", 1024)),
+            overlap=float(tile_raw.get("overlap", 0.2)),
+            merge_iou=float(tile_raw.get("merge_iou", 0.5)),
+        ),
+        sam=SamConfig(
+            enabled=bool(sam_raw.get("enabled", False)),
+            model=str(sam_raw.get("model", "sam2.1_t.pt")),
+            min_box_side_px=int(sam_raw.get("min_box_side_px", 24)),
+        ),
+        class_aliases={str(k).lower(): str(v) for k, v in (prelabel_raw.get("class_aliases") or {}).items()}
+        or PrelabelConfig().class_aliases,
+    )
+
     return Config(
         raw=raw,
+        prelabel=prelabel,
         data_dir=Path(resolved_data_dir),
         host=str(_deep_get(raw, "server", "host", default="127.0.0.1")),
         port=int(_deep_get(raw, "server", "port", default=8787)),

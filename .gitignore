@@ -26,6 +26,8 @@ web/dist/
 .vite/
 
 # 模型与数据文件（大文件不进 git）
+.ultralytics/
+data/weights/
 *.pt
 *.onnx
 *.engine

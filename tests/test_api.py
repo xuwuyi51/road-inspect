@@ -165,9 +165,10 @@ class TestApi(unittest.TestCase):
         self.assertTrue(csv_response.text.startswith("image_id,captured_at"))
 
     def test_unimplemented_endpoints_return_501(self) -> None:
-        response = self.client.post("/api/prelabel/batches", json={})
+        """训练/模型晋级属 M3：当前必须明确 501，而不是静默 404 或假装成功。"""
+        response = self.client.post("/api/runs", json={"kind": "train", "dataset_id": 1})
         self.assertEqual(response.status_code, 501)
-        self.assertIn("M2", response.json()["message"])
+        self.assertIn("M3", response.json()["message"])
 
 
 if __name__ == "__main__":

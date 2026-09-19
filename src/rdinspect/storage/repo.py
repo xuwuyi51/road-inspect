@@ -434,6 +434,50 @@ class Repo:
                 )
         return inserted
 
+    def add_mask_candidate(self, *, task_id: int, class_code: str, bbox: dict[str, float],
+                           mask_path: str, metrics: dict[str, Any] | None = None,
+                           source: str = "model", model_version_id: int | None = None) -> int:
+        """写入一条掩膜标注（kind='mask'）；派生指标存 geometry_json，便于后续统计裂缝宽度。"""
+        task = self.get_task(task_id)
+        if task is None:
+            raise KeyError(f"task {task_id}")
+        with transaction(self.conn):
+            cur = self.conn.execute(
+                """INSERT INTO annotations(task_id, image_id, class_code, kind,
+                                           bbox_x1, bbox_y1, bbox_x2, bbox_y2,
+                                           geometry_json, mask_path, source, model_version_id)
+                   VALUES(?,?,?, 'mask', ?,?,?,?,?,?,?,?)""",
+                (task_id, task["image_id"], class_code, bbox["x1"], bbox["y1"], bbox["x2"], bbox["y2"],
+                 json.dumps(metrics or {}, ensure_ascii=False, sort_keys=True), mask_path, source,
+                 model_version_id),
+            )
+            annotation_id = int(cur.lastrowid)
+            self._audit("annotation", str(task_id), "create-mask", source, None,
+                        {"id": annotation_id, "class_code": class_code, "mask": mask_path,
+                         "metrics": metrics or {}})
+        return annotation_id
+
+    def mask_annotations(self, *, task_id: int | None = None, image_id: int | None = None,
+                         limit: int = 200) -> list[dict[str, Any]]:
+        """待复核的掩膜列表（含派生指标）。"""
+        clauses = ["deleted_at IS NULL", "kind = 'mask'"]
+        params: list[Any] = []
+        if task_id is not None:
+            clauses.append("task_id = ?")
+            params.append(task_id)
+        if image_id is not None:
+            clauses.append("image_id = ?")
+            params.append(image_id)
+        params.append(limit)
+        rows = _dicts(self.conn.execute(
+            f"SELECT * FROM annotations WHERE {' AND '.join(clauses)} ORDER BY id LIMIT ?", params))
+        for row in rows:
+            try:
+                row["mask_metrics"] = json.loads(row["geometry_json"] or "{}")
+            except json.JSONDecodeError:
+                row["mask_metrics"] = {}
+        return rows
+
     def set_prelabel_state(self, task_id: int, state: str) -> None:
         self.conn.execute("UPDATE tasks SET prelabel_state = ? WHERE id = ?", (state, task_id))
 
@@ -600,6 +644,93 @@ class Repo:
             "batches": int(self.conn.execute("SELECT COUNT(*) AS n FROM batches").fetchone()["n"]),
             "datasets": int(self.conn.execute("SELECT COUNT(*) AS n FROM dataset_versions").fetchone()["n"]),
         }
+
+    # ─────────────────────── 模型注册（M2 预标注用） ───────────────────────
+    def upsert_model_version(self, name: str, version: str, *, task: str = "detection",
+                             status: str = "candidate", weights_path: str | None = None,
+                             labels_json: dict | None = None, metrics_json: dict | None = None,
+                             run_id: int | None = None, dataset_id: int | None = None,
+                             actor: str = "system") -> dict[str, Any]:
+        """按 (name, version) 幂等登记模型权重。"""
+        existing = self.conn.execute(
+            "SELECT * FROM model_versions WHERE name = ? AND version = ?", (name, version)).fetchone()
+        if existing is not None:
+            return dict(existing)
+        with transaction(self.conn):
+            cur = self.conn.execute(
+                """INSERT INTO model_versions(name, version, task, status, run_id, dataset_id,
+                                              weights_path, labels_json, metrics_json)
+                   VALUES(?,?,?,?,?,?,?,?,?)""",
+                (name, version, task, status, run_id, dataset_id, weights_path,
+                 json.dumps(labels_json or {}, ensure_ascii=False, sort_keys=True),
+                 json.dumps(metrics_json or {}, ensure_ascii=False, sort_keys=True)),
+            )
+            model_id = int(cur.lastrowid)
+            self._audit("model", f"{name}:{version}", "create", actor, None,
+                        {"id": model_id, "task": task, "status": status, "weights": weights_path})
+        row = self.conn.execute("SELECT * FROM model_versions WHERE id = ?", (model_id,)).fetchone()
+        return dict(row) if row is not None else {}
+
+    def list_model_versions(self, *, task: str | None = None,
+                            status: str | None = None) -> list[dict[str, Any]]:
+        clauses, params = [], []
+        if task:
+            clauses.append("task = ?")
+            params.append(task)
+        if status:
+            clauses.append("status = ?")
+            params.append(status)
+        sql = "SELECT * FROM model_versions"
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY status, id DESC"
+        return _dicts(self.conn.execute(sql, params))
+
+    def production_model(self, *, task: str = "detection") -> dict[str, Any] | None:
+        return _dict(self.conn.execute(
+            "SELECT * FROM model_versions WHERE task = ? AND status = 'production' ORDER BY id DESC LIMIT 1",
+            (task,)).fetchone())
+
+    def set_model_status(self, model_id: int, status: str, *, actor: str = "system") -> bool:
+        before = _dict(self.conn.execute("SELECT * FROM model_versions WHERE id = ?", (model_id,)).fetchone())
+        if before is None:
+            return False
+        with transaction(self.conn):
+            self.conn.execute("UPDATE model_versions SET status = ? WHERE id = ?", (status, model_id))
+            self._audit("model", f"{before['name']}:{before['version']}", "status", actor,
+                        {"status": before["status"]}, {"status": status})
+        return True
+
+    # ─────────────────────── 忽略/删除标注（M2） ───────────────────────
+    def delete_annotation(self, annotation_id: int, *, actor: str = "api") -> bool:
+        """软删一条标注（用于「忽略候选」）。保留审计痕迹，可复查。"""
+        row = _dict(self.conn.execute(
+            "SELECT * FROM annotations WHERE id = ?", (annotation_id,)).fetchone())
+        if row is None or row["deleted_at"] is not None:
+            return False
+        with transaction(self.conn):
+            self.conn.execute("UPDATE annotations SET deleted_at = ? WHERE id = ?", (utc_now(), annotation_id))
+            self._audit("annotation", str(row["task_id"]), "delete", actor,
+                        self._annotation_snapshot(row), {"deleted": True, "id": annotation_id})
+        return True
+
+    # ─────────────────────── 预标注质量统计（M2） ───────────────────────
+    def annotation_source_counts(self, *, include_deleted: bool = True) -> dict[str, int]:
+        sql = "SELECT source, COUNT(*) AS n FROM annotations"
+        if not include_deleted:
+            sql += " WHERE deleted_at IS NULL"
+        sql += " GROUP BY source"
+        return {row["source"]: row["n"] for row in self.conn.execute(sql)}
+
+    def tasks_by_prelabel_state(self) -> dict[str, int]:
+        rows = self.conn.execute(
+            "SELECT prelabel_state, COUNT(*) AS n FROM tasks GROUP BY prelabel_state").fetchall()
+        return {row["prelabel_state"]: row["n"] for row in rows}
+
+    def model_versions_seen(self) -> list[int]:
+        rows = self.conn.execute(
+            "SELECT DISTINCT model_version_id FROM annotations WHERE model_version_id IS NOT NULL").fetchall()
+        return [row["model_version_id"] for row in rows]
 
     # ────────────────────────────── 审计 ──────────────────────────────
     def _audit(self, entity: str, entity_id: str, action: str, actor: str | None,

@@ -23,7 +23,8 @@
 | 状态 | 端点 |
 |---|---|
 | ✅ 已实现 | `/api/health`、`/api/classes`(GET/POST)、`/api/ingest/batches`(POST/GET)、`/api/ingest/upload`、`/api/ingest/batches/{id}`、`/api/images`、`/api/images/{id}/file`、`/api/tasks`、`/api/tasks/lease`、`/api/tasks/{id}`、`/api/tasks/{id}/annotations`(PUT)、`/api/tasks/{id}/adopt-candidates`、`/api/tasks/{id}/submit`、`/api/tasks/{id}/review`、`/api/datasets`(GET/POST)、`/api/datasets/{id}/freeze`、`/api/datasets/{id}/export`、`/api/runs`、`/api/stats/overview`、`/api/stats/export` |
-| ⏳ M2/M3 | `/api/tasks/{id}/prelabel`、`/api/prelabel/batches`、`/api/runs`(POST 训练)、`/api/runs/{id}/cancel`、`/api/models*`（当前返回 **501** 并说明所属里程碑） |
+| ✅ M2 已实现 | `/api/tasks/{id}/prelabel`、`/api/prelabel/batches`、`/api/prelabel/metrics`、`DELETE /api/annotations/{id}`（忽略候选）、`POST|GET /api/annotations/{id}/mask`（SAM 掩膜）、`GET /api/models` |
+| ⏳ M3 | `/api/runs`(POST 训练)、`/api/runs/{id}/cancel`、`/api/models/{id}/promote|export`（当前返回 **501** 并说明所属里程碑）；未安装 ML 依赖时预标注类端点也返回 **501** |
 
 ## 3. 端点总览
 

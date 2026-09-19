@@ -13,6 +13,9 @@ from pathlib import Path
 from .config import Config, ConfigError, load_config
 from .core import datasets as datasets_mod
 from .core.ingest import import_path
+from .prelabel.detector import DetectorUnavailable, ml_available
+from .prelabel.metrics import prelabel_metrics
+from .prelabel.service import DEFAULT_WEIGHTS, prelabel_tasks
 from .storage.db import init_db
 from .storage.files import rebuild_thumbnails
 from .storage.repo import Repo
@@ -63,6 +66,34 @@ def _build_parser() -> argparse.ArgumentParser:
     export.add_argument("--name", required=True)
     export.add_argument("--formats", default="yolo,coco,labelme")
     export.add_argument("--no-copy-images", action="store_true")
+
+    prelabel = sub.add_parser("prelabel", help="模型辅助标注：批量生成候选框（可含 SAM 掩膜）")
+    prelabel.add_argument("--limit", type=int, default=50)
+    prelabel.add_argument("--status", default="pending")
+    prelabel.add_argument("--task", dest="tasks", action="append", type=int, help="只处理指定任务（可重复）")
+    prelabel.add_argument("--model", help=f"权重路径或名称（默认 {DEFAULT_WEIGHTS} 或现役 production 模型）")
+    prelabel.add_argument("--conf", type=float, help="置信度阈值（默认取配置）")
+    prelabel.add_argument("--iou", type=float, help="NMS IoU（默认取配置）")
+    prelabel.add_argument("--device", help="auto|cpu|cuda")
+    prelabel.add_argument("--sam", action="store_true", help="为裂缝候选生成 SAM 掩膜")
+    prelabel.add_argument("--sam-limit", type=int, default=2, help="每张图最多生成几个掩膜")
+
+    quality = sub.add_parser("prelabel-metrics", help="预标注质量看板：采纳率与模型-人工一致性")
+    quality.add_argument("--json", action="store_true")
+
+    models = sub.add_parser("models", help="模型注册表（M2 预标注权重）")
+    models.add_argument("--task", default=None)
+    models.add_argument("--status", default=None)
+
+    classes = sub.add_parser("classes", help="类别注册表：查看 / 新增 / 停用（扩展点，无需改代码）")
+    classes.add_argument("action", choices=["list", "add", "disable", "enable"])
+    classes.add_argument("--code", help="类别 code，如 alligator_crack")
+    classes.add_argument("--zh", help="中文名")
+    classes.add_argument("--en", help="英文名")
+    classes.add_argument("--color", default="#e6194b")
+    classes.add_argument("--order", type=int, default=100, help="YOLO 类别顺序（越小越前）")
+    classes.add_argument("--is-crack", action="store_true")
+    classes.add_argument("--all", action="store_true", help="list 时包含已停用类别")
 
     stats = sub.add_parser("stats", help="统计概览")
     stats.add_argument("--export", choices=["csv", "json"], help="导出标注明细")
@@ -197,6 +228,102 @@ def _cmd_export(args: argparse.Namespace, config: Config) -> int:
         conn.close()
 
 
+def _cmd_prelabel(args: argparse.Namespace, config: Config) -> int:
+    if not ml_available():
+        print("未安装 ML 依赖：请执行 .venv/bin/pip install -e '.[ml]'（详见 docs/08-deployment.md）", file=sys.stderr)
+        return EXIT_DEP
+    conn = init_db(config.db_path)
+    repo = Repo(conn)
+    try:
+        if args.device:
+            config.prelabel.device = args.device
+        report = prelabel_tasks(config, repo, limit=args.limit, status=args.status,
+                                task_ids=args.tasks, model=args.model, conf=args.conf, iou=args.iou,
+                                sam=args.sam or None, sam_limit=args.sam_limit, actor="cli")
+    except DetectorUnavailable as exc:
+        print(f"预标注不可用: {exc}", file=sys.stderr)
+        return EXIT_DEP
+    finally:
+        conn.close()
+    payload = report.as_dict()
+    text = (f"run #{report.run_id}｜任务 {report.processed}/{report.requested}｜候选 {report.candidates}"
+            f"｜掩膜 {report.masks}｜切片 {report.tiles}｜未映射类别 {report.unmapped}"
+            f"｜跳过 {report.skipped}｜错误 {len(report.errors)}")
+    _print(args, payload, text=text)
+    return EXIT_OK if report.processed > 0 or report.requested == 0 else EXIT_RUN
+
+
+def _cmd_prelabel_metrics(args: argparse.Namespace, config: Config) -> int:
+    conn = init_db(config.db_path)
+    repo = Repo(conn)
+    try:
+        data = prelabel_metrics(repo)
+    finally:
+        conn.close()
+    if args.json:
+        print(json.dumps(data, ensure_ascii=False, indent=2))
+    else:
+        rate = data["adoption_rate"]
+        iou_mean = data["model_human_iou_mean"]
+        print(f"已预标注任务 {data['tasks_prelabeled']}｜候选 {data['candidates_total']}｜"
+              f"已采纳 {data['adopted']}｜已忽略 {data['ignored']}｜"
+              f"采纳率 {'—' if rate is None else f'{rate:.1%}'}｜"
+              f"模型-人工 IoU {'—' if iou_mean is None else f'{iou_mean:.2f}'}"
+              f"（匹配率 {'—' if data['model_human_match_rate'] is None else f'{data['model_human_match_rate']:.0%}'}）")
+        if data["prelabel_states"]:
+            print(f"预标注状态分布：{data['prelabel_states']}")
+    return EXIT_OK
+
+
+def _cmd_models(args: argparse.Namespace, config: Config) -> int:
+    conn = init_db(config.db_path)
+    repo = Repo(conn)
+    try:
+        rows = repo.list_model_versions(task=args.task, status=args.status)
+    finally:
+        conn.close()
+    _print(args, rows, text="\n".join(
+        f"{row['name']}:{row['version']} [{row['status']}] {row['task']} weights={row['weights_path']}"
+        for row in rows) or "（模型注册表为空）")
+    return EXIT_OK
+
+
+def _cmd_classes(args: argparse.Namespace, config: Config) -> int:
+    conn = init_db(config.db_path)
+    repo = Repo(conn)
+    try:
+        if args.action == "list":
+            rows = repo.list_classes(active_only=not args.all)
+            _print(args, rows, text="\n".join(
+                f"{'✔' if row['active'] else '✘'} {row['order_index']:>3} {row['code']:<22} {row['name_zh']}"
+                for row in rows))
+            return EXIT_OK
+        if args.action == "add":
+            if not (args.code and args.zh and args.en):
+                print("add 需要 --code/--zh/--en", file=sys.stderr)
+                return EXIT_ARGS
+            if repo.get_class(args.code) is not None:
+                print(f"类别已存在: {args.code}", file=sys.stderr)
+                return EXIT_ARGS
+            created = repo.add_class(args.code, args.zh, args.en, color=args.color,
+                                     is_crack=args.is_crack, order_index=args.order, actor="cli")
+            _print(args, created, text=f"已新增类别 {created['code']}（order={created['order_index']}）；"
+                                       f"注意：类别顺序变化后需新建数据集版本（见 ADR-0005）")
+            return EXIT_OK
+        if not args.code:
+            print(f"{args.action} 需要 --code", file=sys.stderr)
+            return EXIT_ARGS
+        active = args.action == "enable"
+        ok = repo.set_class_active(args.code, active, actor="cli")
+        if not ok:
+            print(f"类别不存在: {args.code}", file=sys.stderr)
+            return EXIT_ARGS
+        print(f"类别 {args.code} 已{'启用' if active else '停用'}（停用不删除历史标注，见 docs/03-data-model.md §8）")
+        return EXIT_OK
+    finally:
+        conn.close()
+
+
 def _cmd_stats(args: argparse.Namespace, config: Config) -> int:
     conn = init_db(config.db_path)
     repo = Repo(conn)
@@ -280,7 +407,8 @@ def main(argv: list[str] | None = None) -> int:
     handlers = {
         "serve": _cmd_serve, "import": _cmd_import, "tasks": _cmd_tasks,
         "dataset": _cmd_dataset, "export": _cmd_export, "stats": _cmd_stats,
-        "thumbs": _cmd_thumbs, "check": _cmd_check,
+        "thumbs": _cmd_thumbs, "check": _cmd_check, "prelabel": _cmd_prelabel,
+        "prelabel-metrics": _cmd_prelabel_metrics, "models": _cmd_models, "classes": _cmd_classes,
     }
     handler = handlers[args.command]
     if args.command == "dataset" and args.action == "freeze" and not args.name:
