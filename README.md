@@ -2,7 +2,7 @@
 
 > 识别道路上 **横向裂缝 / 纵向裂缝 / 坑洞 / 垃圾** 四类灾害（可扩展），支持**人工标注**与**模型辅助标注**，
 > 覆盖「采集 → 标注 → 训练 → 导出 → 边缘离线推理」全链路。
-> **当前状态：M0（架构文档）· M1（采集标注闭环）· M2（模型辅助标注）· M3（训练闭环与门禁）均已交付并在本机实测通过。**
+> **当前状态：M0（架构文档）· M1（采集标注闭环）· M2（模型辅助标注）· M3（训练闭环与门禁）· M4（边缘离线推理）均已交付并在本机实测通过。**
 
 ## 为什么做这个
 
@@ -34,6 +34,7 @@ src/rdinspect/   实现代码（M1 + M2）
 ## 快速阅读顺序
 
 0. [docs/11-training-guide.md](docs/11-training-guide.md) — **M3 训练闭环操作手册**（训练→评估→门禁→导出）
+0. [docs/12-edge-inference.md](docs/12-edge-inference.md) — **M4 边缘推理操作手册**（离线打包→推理→排障）
 1. [docs/00-overview.md](docs/00-overview.md) — 目标、范围、术语
 2. [docs/02-architecture.md](docs/02-architecture.md) — 架构、数据流、时序、扩展点
 3. [docs/03-data-model.md](docs/03-data-model.md) + [db/schema.sql](db/schema.sql) — 数据模型与建库
@@ -71,9 +72,10 @@ src/rdinspect/   实现代码（M1 + M2）
 - **M1 ✅**：采集与标注闭环——导入（照片/视频抽帧/航拍切片、SHA256+pHash 去重、EXIF/GPS）、Web 标注台、任务租约、标注全量提交（差异+审计）、复核、数据集冻结（清单哈希）、三格式导出与往返校验。
 - **M2 ✅**：模型辅助标注——检测器抽象 + **切片推理（SAHI 策略）**、批量/单图预标注（候选落库 `source=model`）、**候选逐条采纳/忽略**、**SAM 裂缝掩膜**（宽度/长度派生指标）、**预标注质量看板**（采纳率、模型-人工 IoU）、类别扩展 CLI；未装 ML 依赖时端点返回 501，人工流程不受影响。
 - **M3 ✅（当前）**：训练闭环与门禁——ultralytics 微调 runner（**日志流 + 断点 + `flipud=0` 硬约束 + run_key 幂等**）、**分类别评估**（官方 val 口径 + 混淆矩阵 + 大小桶召回 + **切片开关对比** + 失败样例叠加图）、**模型门禁**（`candidate→validated→production`，劣化权重 409 拒绝并给出 delta）、**ONNX 导出包**（labels/preprocess/manifest/parity，**一致性验收 ≤1e-3**）、后台训练 API 与 `train`/`runs`/`model` CLI；未装 ML 依赖时返回 501。
-- **M4 起**：边缘离线推理（`rdinspect infer`）→ 主动学习与类别扩展（见 [docs/09-roadmap.md](docs/09-roadmap.md)）。
+- **M4 ✅（当前）**：边缘离线推理——`rdinspect infer`（目录/单图/视频/RTSP、**JSONL+CSV**、**断点续跑**、切片开关、命中快照、**性能基准**）、**启动前导出包校验**（schema 版本/模型 sha256/类别顺序/输出通道/**模型内嵌 names**，任一不匹配退出码 6 拒绝启动）、**离线安装包**（`scripts/build_edge_bundle.py` 生成 wheels+模型+脚本，`--verify` 在临时 venv 里离线安装并冒烟推理）；推理链路**不依赖 torch/ultralytics/数据库**。
+- **M5 起**：主动学习选样与类别扩展（见 [docs/09-roadmap.md](docs/09-roadmap.md)）。
 
-## 快速开始（M1 + M2 + M3）
+## 快速开始（M1 + M2 + M3 + M4）
 
 ```bash
 # 1) 安装（Python 3.11+；不污染其他项目环境）
@@ -115,15 +117,24 @@ python3 -m venv .venv && .venv/bin/pip install -e .
 .venv/bin/rdinspect model promote  --id 1                 # validated → production（旧生产模型自动归档）
 .venv/bin/rdinspect model export   --id 1 --imgsz 320     # ONNX 导出包 + ONNX↔.pt 一致性验收
 
-# 8) 类别扩展（无需改代码；顺序变化需新建数据集版本）
+# 8) 边缘离线推理（M4）：打包 → 离线安装 → 对目录/视频/流推理
+python3 scripts/build_edge_bundle.py --package data/exports/<name>-<version>-320 \
+    --out /tmp/edge-bundle --python-version 3.12 --verify      # 含目标机模拟（临时 venv 离线安装+冒烟推理）
+.venv/bin/rdinspect infer --package data/exports/<name>-<version>-320 \
+    --input /mnt/sd/photos --out ./edge-out --resume --threads 4
+.venv/bin/rdinspect infer --package <导出包> --input patrol.mp4 --fps 2 --out ./edge-out   # 视频抽帧
+.venv/bin/rdinspect infer --package <导出包> --input /mnt/sd --out ./bench --benchmark 60  # 性能基准
+
+# 9) 类别扩展（无需改代码；顺序变化需新建数据集版本）
 .venv/bin/rdinspect classes add --code water_puddle --zh 积水 --en "Water Puddle" --order 10
 
-# 9) 统计与自检
+# 10) 统计与自检
 .venv/bin/rdinspect stats --export csv
 .venv/bin/rdinspect check
 ```
 
-> 训练/评估/门禁/导出的完整操作手册（含排障速查）见 [docs/11-training-guide.md](docs/11-training-guide.md)。
+> 训练/评估/门禁/导出的完整操作手册见 [docs/11-training-guide.md](docs/11-training-guide.md)；
+> 边缘打包与推理见 [docs/12-edge-inference.md](docs/12-edge-inference.md)。
 
 权重下载（国内网络建议走镜像，详见 [docs/05-model-plan.md](docs/05-model-plan.md#51-可直接使用的公开权重m2-实测)）：
 病害检测用 `rezzzq/yolo12s-road-damage-rdd2022`（MIT，RDD2022 训练）放 `data/weights/`；裂缝掩膜用
@@ -136,12 +147,13 @@ python3 scripts/make_sample_data.py --out /tmp/rd-sample --count 500   # 500 张
 python3 scripts/e2e_m1.py --photos 500 --per-class 50                  # M1 端到端验收
 python3 scripts/e2e_m2.py                                              # M2 端到端验收（含真实权重）
 .venv/bin/python scripts/e2e_m3.py --photos 120 --epochs 30 --imgsz 320 # M3 端到端验收（真机训练，约 95 秒）
+.venv/bin/python scripts/e2e_m4.py --package <导出包目录>                 # M4 端到端验收（离线/续跑/性能，约 1 分钟）
 ```
 
 ## 测试
 
 ```bash
-PYTHONPATH=src:tests .venv/bin/python -m unittest discover -s tests -t .   # 189 项单测
+PYTHONPATH=src:tests .venv/bin/python -m unittest discover -s tests -t .   # 232 项单测
 python3 scripts/check_docs.py                                              # 文档/DDL/OpenAPI/样例自检
 python3 scripts/e2e_m1.py                                                  # M1 端到端验收（合成素材）
 python3 scripts/e2e_m2.py                                                  # M2 端到端验收（预标注/采纳/掩膜）
@@ -151,9 +163,10 @@ node scripts/check_annotator_ui.mjs                                        # 标
 
 | 测试层 | 覆盖 | 结果 |
 |---|---|---|
-| 单测（189 项，1 跳过） | 几何换算、pHash 去重、EXIF/质量指标、导入幂等、任务租约、标注差异+审计、复核状态机、数据集划分/冻结/哈希稳定、三格式往返、HTTP 契约（含 400/404/409/501 语义）、预标注幂等与 NMS/切片、类别映射、采纳指标、掩膜派生指标、**检测匹配/AP/混淆矩阵/大小桶**、**训练硬约束与幂等键**、**门禁判定与状态机**、**导出包与 ONNX 预处理几何** | 全部通过 |
+| 单测（232 项，1 跳过） | 几何换算、pHash 去重、EXIF/质量指标、导入幂等、任务租约、标注差异+审计、复核状态机、数据集划分/冻结/哈希稳定、三格式往返、HTTP 契约（含 400/404/409/501 语义）、预标注幂等与 NMS/切片、类别映射、采纳指标、掩膜派生指标、**检测匹配/AP/混淆矩阵/大小桶**、**训练硬约束与幂等键**、**门禁判定与状态机**、**导出包与 ONNX 预处理几何**、**边缘包校验/输出契约/断点续跑** | 全部通过 |
 | 端到端 M1 | 500 张合成照片 + 1 段视频 → 导入 → 四类各 50 张标注复核 → 冻结导出 → 往返零误差 → 哈希可复现 | 通过 |
 | 端到端 M2 | 200 张预标注 → 采纳 120/忽略 40/待处理 40（采纳率 0.60、模型-人工 IoU 0.8626）→ 冻结导出 → 无模型时 501 降级 → 真实 RDD 权重映射率 1.00（18 候选） → SAM 掩膜宽度/长度派生 | 6/6 通过 |
+| 端到端 M4 | 无网代理（死端口）下 200 张图推理 → 断点续跑（100+100，重复 0）→ 与工作站逐框误差 **1e-06** → 四类篡改包**退出码 6 拒绝启动** → 640@4线程 **43.7 FPS**（目标 ≥15）→ 离线安装包 `--verify` 目标机模拟通过（整包 59MB） | 8/8 通过 |
 | 端到端 M3 | 120 张合成图（202 真值框）冻结 → 30 epoch 微调（CPU 66s，末轮 mAP50 0.9345）→ val 评估官方 mAP50 **0.9125** / 内部口径 0.9167 → 首个模型按绝对下限过门禁并提升 production → **COCO 劣化权重被 409 拒绝**（整体 −0.9125 + 4 类类别塌陷）→ ONNX 导出**逐框坐标误差 1e-06**（容差 1e-3）→ HTTP 契约（注册表/运行详情/门禁 409）→ 同参数重复提交复用 run（0.0s） | 13/13 通过 |
 
 ## 目录结构
@@ -173,11 +186,14 @@ src/rdinspect/
 │                         evaluate(分类别指标/混淆矩阵/切片对比/失败样例) ·
 │                         gate(门禁状态机) · export_onnx(导出包+一致性验收) ·
 │                         service(后台任务) · compat(受限容器兼容)
-├── edge/                 onnx_runtime(letterbox/解码/NMS，M4 的 CLI 直接复用)
+├── edge/                 package(启动前校验) · sources(目录/视频/流) ·
+│                         writers(JSONL/CSV/断点状态) · infer(编排+基准) ·
+│                         onnx_runtime(letterbox/解码/NMS)
 └── api/                  FastAPI 应用 + 静态标注台（单文件 1644 行、无构建、零外部依赖）
-tests/                    189 项单测（unittest）
+tests/                    232 项单测（unittest）
 scripts/                  make_sample_data.py · e2e_m1.py · e2e_m2.py · e2e_m3.py ·
-                          check_docs.py · check_annotator_ui.mjs
+                          e2e_m4.py · build_edge_bundle.py · check_docs.py ·
+                          check_annotator_ui.mjs
 ```
 
 > 说明：标注台按 ADR-0002 自建；设计文档里提到的 Vite+React+Konva 方案在 M1 用了「单文件原生 Canvas」实现（零构建、零外部依赖、体积更小），功能对齐 `docs/07-ui-spec.md` 的标注台要求（框选/8 向缩放/快捷键/预标注候选/草稿/亮度对比度）。

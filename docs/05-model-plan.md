@@ -125,7 +125,7 @@
 | 后处理一致性 | NMS/切片合并/坐标还原代码在**工作站与边缘共用同一模块**，只由 `preprocess.json` 参数化 |
 | 量化 | 首选 FP16；INT8 需用冻结验证集校准并复测（目标掉点 ≤ 2 mAP50） |
 | 版本门禁 | 新权重在冻结测试集上不低于现役（容差 ±0.005 mAP50）；未通过仅可标 `candidate`，不得进 `production` |
-| M3 实际导出包 | `model.onnx` + `labels.txt`（类别 code，行号=类别下标）+ `preprocess.json`（letterbox/归一化/NMS 阈值）+ `manifest.json`（数据集清单哈希、训练/导出 run、门禁结论、权重与 ONNX 的 sha256）+ `parity.json` + `README.md`；目录 `data/exports/<name>-<version>/` |
+| M3 实际导出包 | `model.onnx` + `labels.txt`（类别 code，行号=类别下标）+ `preprocess.json`（letterbox/归一化/NMS 阈值）+ `manifest.json`（数据集清单哈希、训练/导出 run、门禁结论、权重与 ONNX 的 sha256）+ `parity.json` + `README.md`；目录 `data/exports/<name>-<version>-<imgsz>/` |
 | M3 一致性验收 | 同一份居中 letterbox 张量分别喂 torch 与 onnxruntime：**逐框归一化坐标最大误差 ≤ 1e-3**（实测 1e-06，容差 1e-3），且两侧不得有独有框；结果写进 `parity.json` 与 `manifest.parity` |
 | 预处理一致性 | ultralytics `predict` 默认 `rect=True`（stride 对齐**非居中**填充）会与导出包不一致（同图分数差 ~2%）→ 工作站检测器显式 `rect=False`，实测与导出包逐框误差 0.0 |
 

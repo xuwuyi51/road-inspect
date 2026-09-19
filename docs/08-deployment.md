@@ -111,9 +111,11 @@ WantedBy=default.target
 | 运行环境 | Linux x86_64（车载主机/NUC）或 Windows；Python 3.11 + onnxruntime（CPU 版约 40MB） |
 | 依赖 | 仅 `onnxruntime` + `pillow`/`opencv-headless` + `numpy`；**无数据库、无浏览器、无 ffmpeg 依赖**（视频输入时需 ffmpeg 或内置解码） |
 | 安装 | 拷贝导出包 + `rdinspect` wheel（离线 `pip install ./wheels/*.whl`） |
-| 运行 | `rdinspect infer --model ./exports/yolo11s-road-onnx --input /mnt/sd --out ./out --device cpu`（M4 提供该 CLI） |
-| M3 已就绪的部分 | 导出包（含 `preprocess.json` 契约）与 `rdinspect.edge.onnx_runtime`：`package_detector(dir)` 直接得到与工作站一致的检测器（居中 letterbox + 类别映射 + 类别感知 NMS），M4 的 CLI 只是它的命令行外壳 |
-| 启动前校验 | `load_export_package()` 会读 `manifest.json`/`preprocess.json`/`labels.txt`，缺文件或类别数与模型不符时直接拒绝启动（M4 会补 manifest 与模型哈希的一致性校验） |
+| 运行 | `rdinspect infer --package ./model/<name>-<version>-<imgsz> --input /mnt/sd --out ./out --resume`（M4 已实现，详见 [12-edge-inference](./12-edge-inference.md)） |
+| 依赖 | 只需 `numpy + pillow + onnxruntime + pyyaml + road-inspect`（**不需要** fastapi/uvicorn/torch）；视频/流额外需要 OpenCV 或 ffmpeg；实测 59MB 离线包（wheels 48.7MB + 模型 10.5MB） |
+| 启动前校验 | `validate_package()` 校验 schema 版本、模型 sha256、labels 一致性、输出通道数 = 4+nc、**模型内嵌 names/imgsz**；任一不匹配 → 退出码 **6**，不产出结果文件 |
+| 性能实测（本机 CPU） | imgsz 640 · 4 线程：p50 22.9ms / **43.7 FPS**（达标 ≥15）；imgsz 320 · 4 线程：p50 6.96ms / **141 FPS**；RSS 峰值 194–438MB |
+| 断点续跑 | `results.jsonl` + `.infer-state.json`（原子写）双保险；状态文件丢失也能从 JSONL 重建，不重复处理 |
 | 加速 | 可选 TensorRT（NVIDIA 设备）、OpenVINO（Intel）；INT8 需在冻结验证集上复测掉点 |
 | 存储 | 结果 JSONL/CSV < 1MB/千帧；可选的现场截图按命中类别保存（默认关闭） |
 | 断点续跑 | `--resume` 记录已处理文件哈希；重复运行跳过已完成项 |

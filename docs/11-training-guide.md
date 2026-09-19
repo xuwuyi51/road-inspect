@@ -102,7 +102,7 @@ curl -X POST localhost:8787/api/train/runs/7/cancel   # epoch 边界停止，已
 .venv/bin/rdinspect model export --id 3 --imgsz 320      # 只有 validated/production 可导出
 ```
 
-导出包 `data/exports/<name>-<version>/`：
+导出包 `data/exports/<name>-<version>-<imgsz>/`（同一版本可按 320/640 各导一份，互不覆盖）：
 
 ```
 model.onnx        opset 17，dynamic batch，simplify

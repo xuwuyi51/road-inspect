@@ -383,6 +383,7 @@ def load_config(path: str | Path | None = None, *, data_dir: str | Path | None =
     @param data_dir - 覆盖数据根目录（命令行 --data-dir 优先）
     @param overrides - 顶层键的浅覆盖（测试用）
     """
+    explicit = path is not None or bool(os.environ.get("ROAD_INSPECT_CONFIG"))
     if path:
         config_path: Path | None = Path(path)
     elif os.environ.get("ROAD_INSPECT_CONFIG"):

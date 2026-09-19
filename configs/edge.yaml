@@ -9,7 +9,9 @@ runtime:
   warmup_runs: 3
 
 inference:
-  imgsz: 640
+  imgsz: null                 # ⚠️ null = 用导出包 preprocess.json 里的尺寸（包是唯一契约）；
+                              # 训练/导出在 320 上做的话这里就别写 640——那会改变 letterbox 比例与精度
+                              # 只有显式想覆盖时才填数字（同时要确认模型输入是动态尺寸）
   conf: 0.25
   iou: 0.5
   max_detections: 100

@@ -27,7 +27,8 @@
 | ✅ M1 已实现 | `/api/health`、`/api/classes`(GET/POST)、`/api/ingest/batches`(POST/GET)、`/api/ingest/upload`、`/api/ingest/batches/{id}`、`/api/images`、`/api/images/{id}/file`、`/api/tasks`、`/api/tasks/lease`、`/api/tasks/{id}`、`/api/tasks/{id}/annotations`(PUT)、`/api/tasks/{id}/adopt-candidates`、`/api/tasks/{id}/submit`、`/api/tasks/{id}/review`、`/api/datasets`(GET/POST)、`/api/datasets/{id}/freeze`、`/api/datasets/{id}/export`、`/api/runs`(仅 GET)、`/api/stats/overview`、`/api/stats/export` |
 | ✅ M2 已实现 | `/api/tasks/{id}/prelabel`、`/api/prelabel/batches`、`/api/prelabel/metrics`、`DELETE /api/annotations/{id}`（忽略候选）、`POST \| GET /api/annotations/{id}/mask`（SAM 掩膜）、`GET /api/models` |
 | ✅ M3 已实现 | `POST /api/train/runs`（异步微调）、`GET /api/train/runs/{id}`（轮询进度）、`POST /api/train/runs/{id}/cancel`、`GET /api/models/registry`、`GET /api/models/{id}`、`POST /api/models/{id}/evaluate`、`POST /api/models/{id}/validate`、`POST /api/models/{id}/promote`、`POST /api/models/{id}/export` |
-| 🚧 M4/M5 未实现（**501**） | 边缘推理（`POST /api/infer` 等）、主动学习选样（`POST /api/active-learning/queue` 等）——所有**未注册的 POST 路径**都落到兜底路由 `POST /api/{rest:path}`，返回 501 与中立文案「`/api/{rest}` 未实现：当前版本已实现 M1–M3 端点（导入/标注/复核/预标注/训练/门禁/导出），M4（边缘推理）与 M5（主动学习）规划中；已实现端点清单见 docs/06-api-spec.md」（**不再误报**某条路径属于某个里程碑）；同一路径的 GET 返回 **405**。CLI 侧对应 `rdinspect infer`（子命令未注册，argparse 直接以退出码 2 报错） |
+| ✅ M4 已实现（**CLI，不提供 HTTP 端点**） | 边缘离线推理走 `rdinspect infer`（目录/单图/视频/RTSP、JSONL/CSV、`--resume`、切片、性能基准），见 §8 与 [12-edge-inference](./12-edge-inference.md)；**刻意不做 REST**：边缘设备不需要 HTTP 服务与数据库 |
+| 🚧 M5 未实现（**501**） | 主动学习选样（`POST /api/active-learning/queue` 等）——所有**未注册的 POST 路径**都落到兜底路由 `POST /api/{rest:path}`，返回 501 与中立文案「`/api/{rest}` 未实现：当前版本已实现 M1–M3 端点（导入/标注/复核/预标注/训练/门禁/导出），M4（边缘推理）与 M5（主动学习）规划中；已实现端点清单见 docs/06-api-spec.md」（**不再误报**某条路径属于某个里程碑）；同一路径的 GET 返回 **405**。CLI 侧对应 `rdinspect infer`（子命令未注册，argparse 直接以退出码 2 报错） |
 | ⚠️ 历史设计、从未实现 | `POST /api/runs`（启动训练/评估）、`GET /api/runs/{id}`、`POST /api/runs/{id}/cancel` 是 M1 期设计，M3 起由 `/api/train/runs*` 承载。这三者仍未实现：POST 落 501 兜底（文案已中立化）、GET 落 405。`openapi.yaml` 中已标 `deprecated: true` |
 
 > 停用声明：`/api/models/{id}/promote|export` 在 M2 文档里曾被描述为「返回 501」——**已不成立**，M3 起两者都是同步实现的真实端点。
@@ -293,6 +294,11 @@ rdinspect model    list
 rdinspect model    show --id N
 rdinspect model    evaluate --id N [--split val]
 rdinspect model    validate --id N [--split val]        # 评估 + 门禁；不通过 → 退出码 5
+rdinspect infer    --package <导出包> --input <目录|视频|rtsp://…> --out <目录>
+                   [--resume|--no-resume] [--limit N] [--tile N|--no-tile] [--threads N]
+                   [--conf X] [--iou X] [--imgsz N] [--fps X] [--snapshots]
+                   [--expect-labels a,b,c] [--no-hash-check] [--benchmark N]
+                   [--edge-config configs/edge.yaml] [--json]
 rdinspect model    promote  --id N                      # 仅 validated 可提升；失败 → 退出码 5
 rdinspect model    export   --id N [--opset 17] [--imgsz 640] [--tolerance 1e-3]
                    [--dynamic-batch] [--half] [--no-verify]
@@ -307,22 +313,43 @@ rdinspect infer    --model exports/<pkg>/ --input <dir|video|rtsp://...> --out .
 退出码：`0` 成功；`2` 参数错误（argparse 拒绝或子命令显式校验，如缺 `--name`/`--id`）；
 `3` 依赖缺失（未安装 ML 依赖：`prelabel`、`train`，以及 `model evaluate/validate/promote/export`）；
 `4` 运行失败（训练未成功、数据集未冻结、模型不存在、未捕获的 `ConfigError`/`ValueError` 等）；
-`5` **门禁未通过**（`model validate` 门禁失败、`model promote` 被拒、`model export` 一致性验收未通过或状态冲突）。
+`5` **门禁未通过**（`model validate` 门禁失败、`model promote` 被拒、`model export` 一致性验收未通过或状态冲突）；
+`6` **导出包校验失败**（`infer` 拒绝启动：schema 版本/模型哈希/类别顺序/输出通道/内嵌 names 任一不匹配）——
+见 §8 与 [12-edge-inference](./12-edge-inference.md) §8。
 
-## 8. 边缘推理输出格式（M4 设计，当前未实现）
+## 8. 边缘推理输出格式（M4 已实现）
+
+输出目录由 `--out` 指定，包含三个文件（契约稳定，新增字段向后兼容）：
+
+**`results.jsonl`** —— 每行一条影像记录：
 
 ```json
-{"image":"frames/000123.jpg","ts":"2026-09-12T02:13:05Z","gps":{"lat":31.2304,"lon":121.4737},
- "model":{"name":"yolo11s-road","version":"2026.09.12-a","imgsz":640},
- "detections":[{"class":"transverse_crack","conf":0.71,"bbox":[0.12,0.34,0.58,0.41]},
-               {"class":"pothole","conf":0.88,"bbox":[0.62,0.55,0.79,0.72]}],
- "tiles":2,"elapsed_ms":41}
+{"image":"sim_00000.jpg","source":"/mnt/sd/photos/sim_00000.jpg","image_sha256":"…",
+ "index":0,"frame_index":null,"ts":"2026-09-10T08:00:00","gps":{"lat":31.219167,"lon":121.434167},
+ "model":{"name":"yolo11n-road","version":"2026.09.19-r1","imgsz":640,"schema_version":1,"labels":[…]},
+ "detections":[{"class":"transverse_crack","conf":0.71,"bbox":[0.12,0.34,0.58,0.41]}],
+ "tiles":1,"elapsed_ms":22.877,"width":640,"height":360}
 ```
 
-配套 `results.csv`（便于表格软件）：`image,ts,lat,lon,class,conf,x1,y1,x2,y2`。
-导出包 `manifest.json` 记录 `rdinspect_version`、类别顺序（`labels`/`classes`）与阈值/切片参数；
-边缘端加载时 `load_export_package` 会校验 `manifest.json`、模型文件与 `preprocess.json`/`labels.txt` 是否存在
-（**注意**：当前没有 `schema_version` 字段，也没有版本不匹配时拒绝启动的逻辑——这是 M4 的待补项）。
+| 字段 | 说明 |
+|---|---|
+| `image` / `source` | 文件名 / 原始来源（视频帧为 `<video>_frame000123.jpg`） |
+| `image_sha256` | 内容哈希（也是断点续跑的键；视频帧取帧字节哈希） |
+| `ts` / `gps` | EXIF 拍摄时间（`YYYY-MM-DDTHH:MM:SS`）与 GPS（无 EXIF 时为 `null`） |
+| `model` | 模型名/版本/imgsz/schema 版本/类别顺序（一次推理内恒定） |
+| `detections[]` | `class`（类别 code）、`conf`、`bbox`（**归一化** `[x1,y1,x2,y2]`） |
+| `tiles` / `elapsed_ms` | 使用的切片数（未切片为 1）/ 该图端到端耗时（毫秒） |
+
+**`results.csv`** —— 每行一条检测：`image,ts,lat,lon,class,conf,x1,y1,x2,y2`；
+**没有检测的图也会占一行**（后 6 列为空），便于按图统计"查了多少张、命中多少张"。
+
+**`.infer-state.json`** —— 断点续跑状态（处理键集合 + 累计计数，原子写；丢失时可由 JSONL 重建）。
+
+启动前校验（任一不匹配 → 退出码 6，不产出结果）：`manifest.schema_version` 存在且 ≤ 运行时支持版本、
+`model.onnx` 的 sha256 与 manifest 一致、`labels.txt` == `manifest.labels` == `manifest.nc`、
+模型输出存在等于 `4+nc` 的维度、**模型内嵌 `names`/`imgsz` 与包内文本一致**、静态输入尺寸与
+`preprocess.input_size` 一致、`--expect-labels` 一致（可选）。
+导出包 `manifest.json` 自 M4 起含 `schema_version` 字段（此前缺失，是该轮的待补项，已补齐）。
 
 ## 9. 契约演进策略
 

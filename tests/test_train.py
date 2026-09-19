@@ -921,3 +921,31 @@ class TestTrainApiStatusCodes(TrainFixture):
         self.assertEqual(again.status_code, 202)
         self.assertTrue(again.json()["cached"])
         self.assertIn("未启动新训练", again.json()["message"])
+
+
+class TestExportPackageIsolation(TrainFixture):
+    """同一权重按不同 imgsz 导出两份包时，模型文件必须彼此独立（硬链接会让后导出覆盖前者）。"""
+
+    def test_two_exports_do_not_share_model_file(self) -> None:
+        weights = self.config.weights_dir / "iso.pt"
+        weights.write_bytes(b"weights")
+        model = self.repo.upsert_model_version(
+            name="iso-road", version="v1", status="validated", weights_path=str(weights),
+            dataset_id=int(self.dataset["id"]),
+            labels_json={"names": [cls["code"] for cls in self.repo.list_classes()]})
+        source = self.tmp_path / "best.onnx"          # 模拟 ultralytics 复用的导出路径
+        source.write_bytes(b"first-export")
+        first = export_mod.build_export_package(
+            self.config, self.repo, model, source, opset=17, dynamic_batch=True, half=False,
+            simplify=True, imgsz=320, dataset=self.dataset, export_run_id=1, tolerance=1e-3)
+        source.write_bytes(b"second-export")          # 第二次导出覆盖同名源文件
+        second = export_mod.build_export_package(
+            self.config, self.repo, model, source, opset=17, dynamic_batch=True, half=False,
+            simplify=True, imgsz=640, dataset=self.dataset, export_run_id=2, tolerance=1e-3)
+        self.assertNotEqual(first["dir"], second["dir"], "不同 imgsz 的包目录必须不同")
+        self.assertEqual(Path(first["model_path"]).read_bytes(), b"first-export")
+        self.assertEqual(Path(second["model_path"]).read_bytes(), b"second-export")
+        manifest = json.loads((Path(first["dir"]) / "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["model_sha256"], export_mod.sha256_file(first["model_path"]),
+                         "manifest 里的哈希必须与包内实际文件一致")
+        self.assertEqual(manifest["schema_version"], 1, "边缘端校验依赖 schema_version")
