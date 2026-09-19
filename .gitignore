@@ -39,3 +39,6 @@ data/weights/
 .idea/
 .DS_Store
 Thumbs.db
+
+# onnxruntime 遥测文件（无法写用户目录时会落在 CWD）
+:memory:.ses

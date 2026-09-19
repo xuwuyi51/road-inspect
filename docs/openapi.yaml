@@ -20,6 +20,7 @@ tags:
   - name: reviews
   - name: datasets
   - name: runs
+  - name: train
   - name: models
   - name: stats
 
@@ -528,71 +529,154 @@ paths:
                 items: { $ref: "#/components/schemas/Run" }
     post:
       tags: [runs]
-      summary: 启动训练或评估
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [kind, dataset_id]
-              properties:
-                kind: { type: string, enum: [train, evaluate] }
-                dataset_id: { type: integer }
-                config:
-                  type: object
-                  properties:
-                    model: { type: string, default: yolo11s.pt }
-                    imgsz: { type: integer, default: 640 }
-                    epochs: { type: integer, default: 100 }
-                    batch: { type: integer, default: 16 }
-                    seed: { type: integer, default: 42 }
-                    flipud: { type: boolean, default: false, description: 必须为 false（横/纵语义） }
-                    lr0: { type: number, default: 0.001 }
-                    resume_from: { type: [string, "null"], description: 从既有权重继续（域适配微调） }
+      deprecated: true
+      summary: 【未实现】启动训练或评估（M1 历史设计；M3 起改用 POST /api/train/runs）
+      description: |
+        该操作**当前未实现**。`POST /api/runs` 会落到兜底路由 `POST /api/{rest:path}` 并返回 **501**
+        （文案已中立化，不再误报里程碑）：
+        「/api/runs 未实现：当前版本已实现 M1–M3 端点（导入/标注/复核/预标注/训练/门禁/导出），
+        M4（边缘推理）与 M5（主动学习）规划中；已实现端点清单见 docs/06-api-spec.md」。
+
+        它是被 M3 取代的 M1 历史设计，并非 M4/M5 能力。
+        现行入口：训练 `POST /api/train/runs`；评估 `POST /api/models/{modelId}/evaluate`；
+        运行记录列表仍用 `GET /api/runs`。
       responses:
-        "202":
-          description: 已排入
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/Run" }
+        "501": { $ref: "#/components/responses/NotImplemented" }
 
   /api/runs/{runId}:
     get:
       tags: [runs]
-      summary: 运行详情（含指标/日志尾部）
+      deprecated: true
+      summary: 【未实现】运行详情（M3 起改用 GET /api/train/runs/{runId}）
+      description: |
+        该操作**当前未实现**。由于存在兜底路由 `POST /api/{rest:path}`，同一路径的 `GET`
+        会被 Starlette 判定为方法不允许，返回 **405**，响应体是 Starlette 默认的
+        `{"detail":"Method Not Allowed"}`（**不经过**统一错误处理器，因此没有 `code` 字段）。
+
+        轮询训练进度请用 `GET /api/train/runs/{runId}`（支持 `?log_lines=`）。
       parameters:
         - $ref: "#/components/parameters/RunId"
-        - name: log_tail
+      responses:
+        "405": { $ref: "#/components/responses/MethodNotAllowed" }
+
+  /api/runs/{runId}/cancel:
+    post:
+      tags: [runs]
+      deprecated: true
+      summary: 【未实现】取消运行（M3 起改用 POST /api/train/runs/{runId}/cancel）
+      description: |
+        该操作**当前未实现**：会落到兜底路由并返回 **501**（文案已中立化，不再误报里程碑）：
+
+        「/api/runs/{runId}/cancel 未实现：当前版本已实现 M1–M3 端点（导入/标注/复核/预标注/训练/门禁/导出），
+        M4（边缘推理）与 M5（主动学习）规划中；已实现端点清单见 docs/06-api-spec.md」。
+
+        中止训练请用 `POST /api/train/runs/{runId}/cancel`。
+      parameters:
+        - $ref: "#/components/parameters/RunId"
+      responses:
+        "501": { $ref: "#/components/responses/NotImplemented" }
+
+  /api/train/runs:
+    post:
+      tags: [train]
+      summary: 提交训练（M3；异步 202 + 轮询，同步 wait=true 为 200）
+      description: |
+        训练默认**异步**：`wait=false` 时立即返回 `202`，训练在服务进程的后台线程中执行，
+        客户端必须轮询 `GET /api/train/runs/{runId}`，直到 `status` 进入终态
+        （`succeeded`/`failed`/`canceled`）。
+        传 `wait=true` 时同步跑完再返回 **200**（`202` 只表示"已接受、稍后完成"）。
+
+        幂等：`run_key = sha256(数据集清单哈希 + arch + 初始权重及其 sha256 + resume + 全部超参 + 增强参数)`。
+        同 `run_key` 重复提交时——既有运行 `succeeded` → 复用该运行（`cached=true`，不重复占用 GPU）；
+        仍在 `running` 且**确实在当前进程内** → **409**；`failed`/`canceled` → 复用同一 run 行重跑。
+
+        僵尸运行（`status=running` 但已不在本进程，即上次服务被杀/重启遗留）：
+        提交时先被收尾为 `failed`（`error=进程中断（服务重启或被杀），运行未完成；已允许按同一配置重新提交`），
+        再复用同一行重跑；服务启动时也会做一次同样的对账（见 `GET /api/train/runs/{runId}` 的 `in_process`）。
+
+        前置条件：数据集必须为 `frozen`（ADR-0005），且 `train`/`val` 划分非空（否则 400）。
+        训练日志落盘 `data/logs/runs/train-<runId>-<slug>.log`；每个 epoch 的指标增量写入
+        `runs.metrics_json.progress`，结束时写入 `final`/`weights_path`/`work_dir`。
+
+        依赖缺失：`start_training()` 在**建 run 之前**做 ML 依赖预检，缺 ultralytics/torch 时直接
+        抛 `DetectorUnavailable` → **501**（`wait` 两种取值都一样），**不会**留下 run 记录。
+        只有「依赖正常、但训练过程本身出错」才在异步分支表现为 `202` 之后该 run 变为 `failed`
+        （原因见 `error`；同步分支则直接在 200 响应里给出 `status=failed`）。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/TrainRunRequest" }
+      responses:
+        "202":
+          description: |
+            **异步分支**（`wait=false`，默认）：已接受，训练在后台线程执行。
+            字段为 run/request/splits/cached/run_id/message（无 model/status）；
+            `cached=true` 时 `message` 为「命中幂等：复用既有运行，未启动新训练」。
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TrainRunAccepted" }
+        "200":
+          description: |
+            **同步分支**（`wait=true`）：训练已结束，返回终止态。
+            字段为 run/request/splits/model/cached/run_id/status（无 message）。
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TrainRunAccepted" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "501": { $ref: "#/components/responses/NotImplemented" }
+
+  /api/train/runs/{runId}:
+    get:
+      tags: [train]
+      summary: 训练运行详情（进度 + 指标 + 日志尾部；轮询用）
+      description: |
+        返回**扁平**的运行详情：`runs` 表字段直接铺在顶层（**没有** `run` 包装，与
+        `POST /api/train/runs` 的响应不同），再叠加 `metrics`、`progress`、`epochs_done`、
+        `final`、`weights_path`、`work_dir`、`log_tail`、`model`、`in_process`。
+
+        * `metrics` = 解析后的 `metrics_json`（对象）；`metrics_json` 列本身仍是 JSON 字符串；
+        * `progress` = `metrics.progress`（最近一个 epoch），无进度时回退 `metrics.final`；
+        * `in_process` = 该 run 是否登记在当前服务进程的后台任务表中。
+          服务启动时会做一次**对账**：`status=running` 但不在本进程的僵尸运行被收尾为
+          `failed`（`error=进程中断（服务重启或被杀），运行未完成…`，并在 `metrics` 里记
+          `interrupted_at`），因此正常情况下不会再看到「`running` 且 `in_process=false`」；
+          对该状态调用 `POST .../cancel` 必定 409（仅当启动对账本身失败时才会出现）。
+      parameters:
+        - $ref: "#/components/parameters/TrainRunId"
+        - name: log_lines
           in: query
-          schema: { type: integer, default: 200 }
+          description: 返回日志尾部行数；0 = 不读日志
+          schema: { type: integer, minimum: 0, maximum: 2000, default: 40 }
       responses:
         "200":
           description: 运行详情
           content:
             application/json:
-              schema:
-                allOf:
-                  - $ref: "#/components/schemas/Run"
-                  - type: object
-                    properties:
-                      log_tail:
-                        type: array
-                        items: { type: string }
+              schema: { $ref: "#/components/schemas/TrainRunDetail" }
+        "400": { $ref: "#/components/responses/BadRequest" }
         "404": { $ref: "#/components/responses/NotFound" }
 
-  /api/runs/{runId}/cancel:
+  /api/train/runs/{runId}/cancel:
     post:
-      tags: [runs]
-      summary: 取消运行（训练/预标注）
+      tags: [train]
+      summary: 请求中止训练（协作式：epoch 边界生效）
+      description: |
+        协作式取消：置中断标志，当前 epoch 结束后停止训练；已产出的 `best.pt`/`last.pt` 保留，
+        可用于续训。仅当 run 处于 `running` **且**登记在当前服务进程内才受理：
+        服务重启前的任务不在进程内 → **409**（需直接终止对应训练进程）。
       parameters:
-        - $ref: "#/components/parameters/RunId"
+        - $ref: "#/components/parameters/TrainRunId"
       responses:
         "200":
-          description: 已请求取消
+          description: 已受理取消请求（任务将在当前 epoch 结束时停止）
           content:
             application/json:
-              schema: { $ref: "#/components/schemas/Run" }
+              schema: { $ref: "#/components/schemas/TrainCancelResult" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
 
   /api/models:
     get:
@@ -614,40 +698,164 @@ paths:
                 type: array
                 items: { $ref: "#/components/schemas/ModelVersion" }
 
-  /api/models/{modelId}/promote:
-    post:
+  /api/models/registry:
+    get:
       tags: [models]
-      summary: 晋级模型（candidate → validated → production），门禁不通过时返回 409
+      summary: 模型注册表摘要（含门禁结论与主指标；M3）
+      description: |
+        与 `GET /api/models` 的区别：这里返回的是 `gate.model_summary()` 压缩后的**摘要**，
+        把 `metrics_json`/`gate_json` 解析成 `map50`/`per_class_map50`/`gate`/`gate_passed`/
+        `train_metrics` 等直接可用的字段（原始 JSON 字符串列不再出现）。
+      responses:
+        "200":
+          description: 模型摘要列表
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/ModelSummary" }
+
+  /api/models/{modelId}:
+    get:
+      tags: [models]
+      summary: 模型详情（摘要 + 上次评估结果）
+      description: |
+        摘要字段同 `GET /api/models/registry`，另附 `evaluation`（上次评估的完整结果，
+        未评估时为空对象 `{}`）。
       parameters:
         - $ref: "#/components/parameters/ModelId"
       responses:
         "200":
-          description: 晋级后模型
+          description: 模型详情
           content:
             application/json:
-              schema: { $ref: "#/components/schemas/ModelVersion" }
+              schema: { $ref: "#/components/schemas/ModelDetail" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/models/{modelId}/evaluate:
+    post:
+      tags: [models]
+      summary: 评估模型（官方 val 口径 + 内部匹配口径；写入 runs 与 metrics_json.evaluation）
+      description: |
+        同步执行一次完整评估：官方 ultralytics val 指标 + 内部 IoU 匹配口径
+        （逐类 P/R、混淆矩阵、大小桶召回）+（可选）切片开关对比 + 失败样例导出。
+        结果写入 `model_versions.metrics_json.evaluation` 与 `evaluated_at`，
+        同时新建一条 `kind=evaluate` 的 run 记录。
+      parameters:
+        - $ref: "#/components/parameters/ModelId"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ModelEvaluateRequest" }
+      responses:
+        "200":
+          description: 评估结果
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ModelEvaluateResult" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "501": { $ref: "#/components/responses/NotImplemented" }
+
+  /api/models/{modelId}/validate:
+    post:
+      tags: [models]
+      summary: 校验模型（评估 + 门禁；不通过返回 409）
+      description: |
+        `evaluate` + `gate` 一步完成。通过时把状态置为 `validated`（**仍不是生产模型**，
+        需再显式调用 `/promote`）；不通过时状态保持/退回 `candidate`，
+        返回 **409**，`message` 里带上不通过原因与 `delta`，
+        例如「门禁未通过：整体 mAP50 下降 0.3425 超过容差 0.0050（…）；类别塌陷：pothole …；
+        delta={...}」。无论通过与否，完整门禁结论都写入 `model_versions.gate_json`，
+        可通过 `GET /api/models/{modelId}` 的 `gate` 字段回看。
+
+        其它 409：模型已是 production（无需再校验）、模型还没有评估结果。
+      parameters:
+        - $ref: "#/components/parameters/ModelId"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ModelEvaluateRequest" }
+      responses:
+        "200":
+          description: 门禁通过，模型状态置为 validated
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ModelValidateResult" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "501": { $ref: "#/components/responses/NotImplemented" }
+
+  /api/models/{modelId}/promote:
+    post:
+      tags: [models]
+      summary: 提升为生产模型（仅 validated → production；同任务旧 production 自动归档）
+      description: |
+        只有 `validated` 模型可提升；提升成功后同任务下其它 `production` 模型被自动置为
+        `archived`（`archived` 返回被归档的模型 id 列表），保证同任务只有一个生产模型。
+
+        其它结果：
+        * 已是 production → **200**，形状与首次一致（含 `gate`/`weights_path`），`changed=false`、
+          `archived=[]`，另带 `message`「已是生产模型」；
+        * 状态非 validated（如 candidate/archived）→ **409**，若最近一次门禁未通过，
+          `message` 会附上不通过原因；
+        * 状态是 validated 但缺少通过的门禁记录（例如模型行被外部改动）→ **409**。
+      parameters:
+        - $ref: "#/components/parameters/ModelId"
+      responses:
+        "200":
+          description: 提升结果
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ModelPromoteResult" }
+        "404": { $ref: "#/components/responses/NotFound" }
         "409": { $ref: "#/components/responses/Conflict" }
 
   /api/models/{modelId}/export:
     post:
       tags: [models]
-      summary: 导出边缘包（ONNX + labels + preprocess + manifest）
+      summary: 导出边缘包（ONNX + labels + preprocess + manifest + 一致性验收）
+      description: |
+        同步导出，仅 `validated`/`production` 模型可导出。产物是边缘端唯一需要的目录
+        `exports/<name>-<version>/`：`model.onnx`、`labels.txt`（行号 = 类别下标）、
+        `preprocess.json`（letterbox/归一化/NMS 契约）、`manifest.json`（溯源）、`README.md`，
+        `verify=true` 时另落 `parity.json`。
+        响应里 `package` 的**键集稳定**（`verify=false` 时 `parity_path=null`，`manifest` 照常返回）。
+
+        一致性验收（`verify=true`，默认）：同一 letterbox 张量分别喂 torch 与 onnxruntime，
+        比较原始输出与**同一套解码/NMS** 后的逐框归一化坐标；判据为
+        `max_bbox_delta ≤ tolerance` **且**两侧独有框数为 0。不通过时：导出仍落盘（便于排查），
+        `parity.passed=false`、`registered=false`，且**不更新**模型的 `onnx_path`。
+
+        409 的两种情形（都发生在建 export run **之前**，不会白烧一次导出算力）：
+        状态非 validated/production；模型类别顺序与当前类别表不一致
+        （需按新类别顺序重新冻结数据集训练，ADR-0005）。
+
+        **依赖缺失/权重不可读 → 501**：未安装 ultralytics/torch（导出与一致性验收两处都预检）、
+        或权重文件损坏/无法加载，都返回 501；CLI 对应退出码 3。
+        注意：权重加载失败发生在 export run 创建**之后**，因此会留下一条 `status=failed` 的
+        export 运行记录（便于排查），而 409 不会留下任何 run。
       parameters:
         - $ref: "#/components/parameters/ModelId"
       requestBody:
+        required: false
         content:
           application/json:
-            schema:
-              type: object
-              properties:
-                opset: { type: integer, default: 17 }
-                dynamic_batch: { type: boolean, default: true }
+            schema: { $ref: "#/components/schemas/ModelExportRequest" }
       responses:
-        "202":
-          description: 已排入导出
+        "200":
+          description: 导出结果（含一致性验收报告）
           content:
             application/json:
-              schema: { $ref: "#/components/schemas/Run" }
+              schema: { $ref: "#/components/schemas/ModelExportResult" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "501": { $ref: "#/components/responses/NotImplemented" }
 
   /api/stats/overview:
     get:
@@ -698,6 +906,10 @@ components:
     IdempotencyKey:
       name: Idempotency-Key
       in: header
+      deprecated: true
+      description: |
+        【未实现】服务端**忽略**该请求头（见 06-api-spec §1/§5）。标注提交的幂等性由服务端按
+        `(task_id, annotation_id)` diff 天然保证（重复提交同一内容 changed=0）。
       schema: { type: string, maxLength: 128 }
     BatchId:
       name: batchId
@@ -724,6 +936,12 @@ components:
       in: path
       required: true
       schema: { type: integer }
+    TrainRunId:
+      name: runId
+      in: path
+      required: true
+      description: 训练运行 id（`runs.id`）
+      schema: { type: integer }
     ModelId:
       name: modelId
       in: path
@@ -731,13 +949,34 @@ components:
       schema: { type: integer }
 
   responses:
+    BadRequest:
+      description: |
+        参数非法。**同一个 400 有两种体**（按 `details` 是否出现区分）：
+        1) 业务校验失败（train/val 划分为空、`flipud` 非 0、未知导出格式…）→ `{"code","message"}`；
+        2) 请求体/查询参数/路径参数未通过 schema 校验（区间越界、类型错误、JSON 解析失败）→
+        `{"code":"http_400","message":"请求参数不合法：<loc>: <msg>；…","details":{"errors":["<msg>",…]}}`
+        （由 `RequestValidationError` 处理器产出，**不是** FastAPI 默认的 422）。
+      content:
+        application/json:
+          schema:
+            oneOf:
+              - $ref: "#/components/schemas/Error"
+              - $ref: "#/components/schemas/ValidationError"
+    MethodNotAllowed:
+      description: 路径匹配但方法不允许（Starlette 默认体，不经过统一错误处理器）
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              detail: { type: string }
     NotFound:
       description: 资源不存在
       content:
         application/json:
           schema: { $ref: "#/components/schemas/Error" }
     Conflict:
-      description: 冲突（重名/状态不允许/门禁未通过）
+      description: 冲突（重名/状态不允许/数据集未冻结/同配置训练在跑/门禁未通过）
       content:
         application/json:
           schema: { $ref: "#/components/schemas/Error" }
@@ -746,15 +985,44 @@ components:
       content:
         application/json:
           schema: { $ref: "#/components/schemas/Error" }
+    NotImplemented:
+      description: |
+        未实现。**两种来源**：
+        1) 未注册的 POST 路径落到兜底路由 `POST /api/{rest:path}`，文案为
+        「/api/{rest} 未实现：当前版本已实现 M1–M3 端点（导入/标注/复核/预标注/训练/门禁/导出），
+        M4（边缘推理）与 M5（主动学习）规划中；已实现端点清单见 docs/06-api-spec.md」；
+        2) 依赖缺失：未安装 ML 依赖（ultralytics/torch）时，预标注、训练提交、模型导出与
+        一致性验收都返回 501 + 依赖提示（见各端点说明）。
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
 
   schemas:
     Error:
       type: object
       required: [code, message]
+      description: |
+        统一错误体：`code` 恒为 `http_<status>`（如 `http_409`），`message` 为中文说明。
+        `details` **仅在请求校验失败（400）时出现**（形如 `{"errors":[...]}`）；
+        06-api-spec §4 的语义错误码仍是规划项，尚未实现。
       properties:
-        code: { type: string, description: 机器可读错误码，如 dataset_name_taken }
-        message: { type: string }
-        details: { type: object, additionalProperties: true }
+        code: { type: string, description: "当前实现恒为 http_<status>；语义码见 06-api-spec §4（规划）" }
+        message: { type: string, description: 中文说明；门禁未通过时会带上 reasons 与 delta }
+        details: { type: object, additionalProperties: true, description: 请求校验失败时带 errors 数组；其它错误不返回 }
+
+    ValidationError:
+      type: object
+      required: [code, message]
+      description: |
+        请求校验失败体（400，`RequestValidationError` 处理器产出）。**不是** FastAPI 默认的 422 /
+        `{"detail":[...]}`；`message` 汇总前 5 条问题，逐条原文放 `details.errors`。
+      properties:
+        code: { type: string, enum: ["http_400"] }
+        message: { type: string, description: "请求参数不合法：<loc>: <msg>；…" }
+        details:
+          type: object
+          properties:
+            errors: { type: array, items: { type: string }, description: 各条校验失败的 msg 原文 }
 
     Class:
       type: object
@@ -917,34 +1185,420 @@ components:
     Run:
       type: object
       required: [id, kind, status]
+      description: |
+        `runs` 表的**原始行**（字段名即列名）。注意 `config_json`/`metrics_json` 是
+        **JSON 字符串**列而不是对象；解析后的指标见 `TrainRunDetail.metrics`。
       properties:
         id: { type: integer }
         kind: { type: string, enum: [ingest, prelabel, train, evaluate, export] }
         status: { type: string, enum: [queued, running, succeeded, failed, canceled] }
-        run_key: { type: [string, "null"] }
-        config: { type: object }
+        run_key: { type: [string, "null"], description: 幂等键（sha256 前 32 位十六进制） }
+        config_json: { type: string, description: JSON 字符串：请求/参数快照 }
         dataset_id: { type: [integer, "null"] }
         model_id: { type: [integer, "null"] }
-        metrics: { type: [object, "null"] }
-        error: { type: [string, "null"] }
+        log_path: { type: [string, "null"], description: "日志路径，如 data/logs/runs/train-<id>-<slug>.log" }
+        metrics_json: { type: string, description: "JSON 字符串：进度 progress/epochs_done 与终态 final/weights_path/work_dir/train_params" }
+        error: { type: [string, "null"], description: "失败原因，形如 <ExceptionType>: <message>" }
         started_at: { type: [string, "null"], format: date-time }
         finished_at: { type: [string, "null"], format: date-time }
+        created_at: { type: string, format: date-time }
+
+    TrainRunRequest:
+      type: object
+      description: 训练请求（M3）：只暴露常用旋钮，其余走 configs/train.yaml。
+      properties:
+        dataset: { type: [string, "null"], description: 数据集名 ds-xxx；缺省用 configs/train.yaml 的 dataset.name（须 frozen） }
+        name: { type: [string, "null"], description: 登记模型名；缺省 <arch 主干>-road }
+        version: { type: [string, "null"], description: 模型版本号；缺省 <YYYY.MM.DD>-r<runId> }
+        arch: { type: [string, "null"], description: 初始架构/权重（如 yolo11s.pt）；缺省 configs/train.yaml 的 model.arch }
+        resume_from: { type: [string, "null"], description: 微调起点权重；文件名恰为 weights/last.pt 时按真续训（带优化器状态）处理 }
+        epochs: { type: [integer, "null"], minimum: 1, maximum: 2000, description: 缺省 configs/train.yaml 的 train.epochs }
+        imgsz: { type: [integer, "null"], minimum: 64, maximum: 2048, description: 缺省 configs/train.yaml 的 train.imgsz }
+        batch: { type: [integer, "null"], minimum: 1, maximum: 256, description: 缺省 configs/train.yaml 的 train.batch }
+        device: { type: [string, "null"], description: "auto | cpu | cuda | 0；缺省 configs/train.yaml 的 train.device" }
+        wait:
+          type: boolean
+          default: false
+          description: |
+            true = 同步等待训练跑完再返回（小样本/测试用，会占用请求线程）；
+            false = 后台线程 + 客户端轮询（默认）。
+            pydantic 宽松解析：`true`/`"yes"`/`"on"`/`1` 都视为 true。
+          examples: [false]
+
+    TrainRequestSummary:
+      type: object
+      description: 解析后的训练参数摘要（`request` 字段；超参最终值以此为准）
+      properties:
+        dataset: { type: string }
+        manifest_hash: { type: [string, "null"], description: 数据集清单哈希（run_key 的组成部分） }
+        arch: { type: string }
+        weights_init: { type: [string, "null"], description: 实际使用的初始权重路径 }
+        resume: { type: boolean }
+        run_name: { type: string }
+        run_key: { type: string, description: 幂等键（sha256 前 32 位十六进制） }
+        epochs: { type: [integer, "null"] }
+        imgsz: { type: [integer, "null"] }
+        batch: { type: [integer, "null"] }
+        device: { type: [string, "null"] }
+        augment:
+          type: object
+          additionalProperties: { type: number }
+          description: 透传给 ultralytics 的增强参数（未显式放行时 flipud 恒为 0）
+
+    TrainRunAccepted:
+      type: object
+      required: [run, request, splits, cached, run_id]
+      description: |
+        训练提交结果（两个分支的**状态码与字段集**都不同）：
+        `wait=false` → **202**，字段 run/request/splits/cached/run_id/message（无 model/status）；
+        `wait=true` → **200**，字段 run/request/splits/model/cached/run_id/status（无 message）。
+      properties:
+        run: { $ref: "#/components/schemas/Run" }
+        request: { $ref: "#/components/schemas/TrainRequestSummary" }
+        splits:
+          type: object
+          description: data.yaml 各划分的图片数（只列出 data.yaml 中存在的划分，通常是 train/val/test）
+          additionalProperties: { type: integer }
+        model:
+          description: 仅 `wait=true` 返回：本次训练登记的 candidate 模型行（`model_versions` 原始行）；未登记为 null
+          oneOf:
+            - $ref: "#/components/schemas/ModelVersion"
+            - type: "null"
+        cached:
+          type: boolean
+          description: true = 命中幂等键、复用了既有 succeeded 运行（未重新训练）
+        run_id:
+          type: [integer, "null"]
+          description: 运行 id（= `run.id`）。命中幂等键（`cached=true`）时同样返回既有运行的 id。
+        message: { type: string, description: 仅 `wait=false` 返回的提示文案 }
+        status: { type: [string, "null"], description: 仅 `wait=true` 返回：运行终态（succeeded/failed/canceled） }
+
+    TrainRunDetail:
+      description: 训练运行详情（`runs` 表字段**直接铺在顶层**，无 `run` 包装 + 以下派生字段）
+      allOf:
+        - $ref: "#/components/schemas/Run"
+        - type: object
+          properties:
+            metrics:
+              type: object
+              description: 解析后的 `metrics_json`；训练中为 {progress, epochs_done}，结束后另有 final/weights_path/last_weights/work_dir/train_params/log_path/resumed
+            progress: { type: [object, "null"], description: 最近一个 epoch 的指标（metrics.progress）；无进度时回退 metrics.final }
+            epochs_done: { type: [integer, "null"], description: 已完成 epoch 数 }
+            final:
+              type: [object, "null"]
+              description: 训练结束时 results.csv 末行（列名归一化：map50/map50_95/precision/recall/train_box_loss/lr/epoch…）
+            weights_path: { type: [string, "null"], description: best.pt（缺失时回退 last.pt） }
+            work_dir: { type: [string, "null"], description: "ultralytics 运行目录，如 data/runs/run-<runId>-<slug>" }
+            log_tail:
+              type: array
+              items: { type: string }
+              description: 日志尾部（按 `log_lines` 截取；文件不存在时为空数组）
+            model:
+              description: 该 run 登记的模型行（`model_versions` 原始行）；无则 null
+              oneOf:
+                - $ref: "#/components/schemas/ModelVersion"
+                - type: "null"
+            in_process: { type: boolean, description: 该 run 是否仍在当前服务进程的后台任务表内；服务启动对账后遗留的 running 运行会被收尾为 failed }
+
+    TrainCancelResult:
+      type: object
+      required: [run_id, status, cancel_requested]
+      properties:
+        run_id: { type: integer }
+        status: { type: string, description: 受理时的运行状态（仍为 running） }
+        cancel_requested: { type: boolean, enum: [true] }
+        note: { type: string, description: "实现文案：将在当前 epoch 结束时停止；已生成的 best.pt/last.pt 仍可用于续训" }
 
     ModelVersion:
       type: object
       required: [id, name, version, status, task]
+      description: |
+        `model_versions` 表的**原始行**（`GET /api/models` 列表项、训练响应里的 `model` 字段）。
+        `labels_json`/`metrics_json`/`gate_json` 是 **JSON 字符串**列；压缩后的摘要形态见
+        `ModelSummary`。
       properties:
         id: { type: integer }
         name: { type: string }
         version: { type: string }
         task: { type: string, enum: [detection, segmentation, zeroshot] }
         status: { type: string, enum: [candidate, validated, production, archived] }
+        run_id: { type: [integer, "null"], description: 训练 run id }
         dataset_id: { type: [integer, "null"] }
-        metrics: { type: [object, "null"] }
-        gate: { type: [object, "null"] }
-        labels: { type: [object, "null"] }
-        sha256: { type: [string, "null"] }
+        weights_path: { type: [string, "null"] }
+        onnx_path: { type: [string, "null"], description: 仅在导出一致性验收通过后才更新 }
+        labels_json: { type: [string, "null"], description: 'JSON 字符串 {"names":[...],"nc":n,...}；names 顺序须与冻结数据集一致' }
+        metrics_json: { type: [string, "null"], description: 'JSON 字符串：{"train":…,"epochs_done":…,"train_params":…,"evaluation":…,"evaluated_at":…}' }
+        gate_json: { type: [string, "null"], description: JSON 字符串：最后一次 GateDecision }
+        sha256: { type: [string, "null"], description: 权重文件 sha256 }
         created_at: { type: string, format: date-time }
+
+    ModelSummary:
+      type: object
+      required: [id, name, version, task, status]
+      description: 模型紧凑摘要（`GET /api/models/registry`、`GET /api/models/{modelId}` 用）
+      properties:
+        id: { type: integer }
+        name: { type: string }
+        version: { type: string }
+        task: { type: string, enum: [detection, segmentation, zeroshot] }
+        status: { type: string, enum: [candidate, validated, production, archived] }
+        weights_path: { type: [string, "null"] }
+        onnx_path: { type: [string, "null"], description: 导出一致性验收通过后才有值 }
+        sha256: { type: [string, "null"] }
+        run_id: { type: [integer, "null"] }
+        dataset_id: { type: [integer, "null"] }
+        map50: { type: [number, "null"], description: 主口径 mAP50（官方 val 优先，否则内部口径）；未评估为 null }
+        map50_95: { type: [number, "null"] }
+        per_class_map50:
+          type: object
+          additionalProperties: { type: number }
+          description: 逐类别 mAP50；未评估时为空对象
+        gate:
+          description: 最近一次门禁结论；从未校验为 null
+          oneOf:
+            - $ref: "#/components/schemas/GateDecision"
+            - type: "null"
+        gate_passed: { type: [boolean, "null"], description: 门禁是否通过；从未校验为 null }
+        train_metrics: { type: [object, "null"], description: metrics_json.train（训练结束时 results.csv 末行）；未训练为 null }
+        evaluated_at: { type: [string, "null"], format: date-time }
+        artifacts: { type: [object, "null"], description: 评估产物路径（metrics/report/work_dir） }
+
+    ModelDetail:
+      description: 模型详情 = 摘要 + 上次评估结果
+      allOf:
+        - $ref: "#/components/schemas/ModelSummary"
+        - type: object
+          properties:
+            evaluation: { $ref: "#/components/schemas/ModelEvaluation" }
+
+    ModelEvaluateRequest:
+      type: object
+      description: 评估/校验的可选参数（不传 body 等价于全默认）
+      properties:
+        split: { type: [string, "null"], description: 评估划分；缺省取 configs/train.yaml 的 evaluate.splits 的第一项（val） }
+
+    ModelEvaluation:
+      type: object
+      description: |
+        完整评估结果（写入 `model_versions.metrics_json.evaluation`，并落盘
+        `data/runs/eval-<runId>-<dataset>-<split>/metrics-<split>.json`）
+      properties:
+        dataset: { type: string }
+        dataset_id: { type: integer }
+        manifest_hash: { type: [string, "null"] }
+        split: { type: string }
+        conf: { type: number }
+        iou: { type: number }
+        imgsz: { type: integer, description: 缺省沿用该模型训练时的 imgsz }
+        weights: { type: string }
+        weights_sha256: { type: [string, "null"] }
+        generated_at: { type: string }
+        work_dir: { type: string }
+        ultralytics:
+          type: object
+          description: 官方 val 口径（map50/map50_95/per_class…）；官方 val 失败时含 error 字段（不阻塞内部口径）
+        internal:
+          type: object
+          description: 内部匹配口径：map50（含 per_class/classes_with_gt）、precision_recall、confusion_matrix、size_bucket_recall、images/gt_boxes/pred_boxes/unmapped_classes
+        sahi_ablation: { type: [object, "null"], description: 切片开关对比（configs/train.yaml 的 evaluate.sahi_ablation） }
+        failures: { type: object, description: 失败样例导出统计（dir/total/exported/worst） }
+        artifacts:
+          type: object
+          description: 产物路径
+          properties:
+            metrics: { type: string }
+            report: { type: string }
+            work_dir: { type: string }
+
+    ModelEvaluateResult:
+      type: object
+      required: [model_id, run_id, split, metrics]
+      properties:
+        model_id: { type: integer }
+        run_id: { type: integer, description: 本次评估新建的 runs 行（kind=evaluate） }
+        split: { type: string }
+        metrics: { $ref: "#/components/schemas/ModelEvaluation" }
+
+    ModelValidateResult:
+      type: object
+      required: [model_id, status, gate, run_id, metrics]
+      description: 评估 + 门禁一步完成；通过时状态置 validated（仍需显式 promote 才是 production）
+      properties:
+        model_id: { type: integer }
+        status: { type: string, enum: [validated] }
+        gate: { $ref: "#/components/schemas/GateDecision" }
+        run_id: { type: integer, description: 本次评估新建的 runs 行 }
+        metrics: { $ref: "#/components/schemas/ModelEvaluation" }
+
+    ModelPromoteResult:
+      type: object
+      required: [model_id, status, changed]
+      description: |
+        提升结果。两次调用的形状一致（都带 `gate` 与 `weights_path`）：
+        首次提升 `changed=true`、`archived` 列出被归档的旧生产模型；
+        已是 production 时 `changed=false`、`archived=[]`，并多一个 `message`。
+      properties:
+        model_id: { type: integer }
+        status: { type: string, enum: [production] }
+        changed: { type: boolean, description: true = 本次调用完成了状态提升 }
+        archived:
+          type: array
+          items: { type: integer }
+          description: 被自动归档为 archived 的同任务旧生产模型 id 列表（已是 production 时为空数组）
+        gate:
+          description: 提升所依据的门禁结论（`model_versions.gate_json`）；无门禁记录时为 null
+          oneOf:
+            - $ref: "#/components/schemas/GateDecision"
+            - type: "null"
+        weights_path: { type: [string, "null"], description: 生产权重路径 }
+        message: { type: string, description: 仅 `changed=false` 时返回（如「已是生产模型」） }
+
+    ModelExportRequest:
+      type: object
+      description: 导出参数（全部可选，缺省取 configs/train.yaml 的 export.*）
+      properties:
+        opset: { type: [integer, "null"], minimum: 11, maximum: 20, description: ONNX opset；缺省 export.onnx.opset（17） }
+        dynamic_batch: { type: [boolean, "null"], description: 动态 batch 维；缺省 export.onnx.dynamic_batch（true） }
+        simplify: { type: [boolean, "null"], description: onnxsim 图简化；缺省 export.onnx.simplify（true） }
+        half: { type: [boolean, "null"], description: FP16 导出；缺省 export.onnx.half（false） }
+        imgsz: { type: [integer, "null"], minimum: 64, maximum: 2048, description: 导出分辨率；缺省沿用该模型训练时的 imgsz }
+        verify: { type: boolean, default: true, description: 是否做 ONNX↔.pt 一致性验收（关闭则不产出 parity.json） }
+        tolerance: { type: [number, "null"], exclusiveMinimum: 0, maximum: 0.1, description: 归一化坐标最大绝对误差容差；缺省 export.tolerance（0.001） }
+        parity_images: { type: integer, minimum: 1, maximum: 64, default: 8, description: 验收用图数量（优先 test，其次 val，最后 train 划分） }
+
+    ExportPackage:
+      type: object
+      required: [dir, model_path, labels, manifest_path, preprocess_path, parity_path, manifest]
+      description: |
+        导出包目录 `exports/<name>-<version>/`。文件：`model.onnx`、`labels.txt`
+        （类别 code，行号 = 模型类别下标）、`preprocess.json`（letterbox/归一化/NMS 契约）、
+        `manifest.json`（溯源：清单哈希、训练/导出 run、门禁结论、权重 sha256）、`README.md`；
+        `verify=true` 时另落 `parity.json`。
+
+        **键集稳定**：`verify=false` 时同样返回 `parity_path`（`null`）与 `manifest`，
+        调用方不需要按 `verify` 分支解析。
+      properties:
+        dir: { type: string, description: 导出包目录绝对路径 }
+        model_path: { type: string, description: 包内 model.onnx 路径 }
+        labels: { type: array, items: { type: string }, description: 类别 code 列表（顺序 = 类别下标） }
+        manifest_path: { type: string }
+        preprocess_path: { type: string }
+        parity_path: { type: [string, "null"], description: 包内 parity.json 路径；`verify=false` 时为 null }
+        model_sha256: { type: string }
+        model_size_bytes: { type: integer }
+        manifest: { type: object, description: manifest.json 的内容（`verify=true` 时另含 parity 摘要） }
+
+    ParityReport:
+      type: object
+      required: [passed, tolerance, images, max_bbox_delta]
+      description: |
+        ONNX↔.pt 一致性验收报告。做法：同一 letterbox 张量分别喂 torch 与 onnxruntime，
+        比较原始输出，再用**同一套**解码 + NMS 比较逐框归一化坐标。
+        判据：`max_bbox_delta ≤ tolerance` **且** `unmatched_pt == unmatched_onnx == 0`。
+        不通过时导出仍落盘（便于排查），但 `registered=false` 且不更新模型的 `onnx_path`。
+      properties:
+        passed: { type: boolean }
+        tolerance: { type: number, description: 判定容差 }
+        images: { type: integer, description: 实际参与验收的图片数 }
+        imgsz: { type: integer, description: 取自包内 preprocess.json 的 input_size }
+        conf: { type: number, description: 取自包内 postprocess.conf }
+        iou: { type: number, description: 取自包内 postprocess.iou }
+        boxes: { type: integer, description: .pt 侧解码框总数 }
+        matched: { type: integer, description: 两侧匹配上的框数（IoU 0.5） }
+        unmatched_pt: { type: integer, description: .pt 独有框数（判据之一） }
+        unmatched_onnx: { type: integer, description: ONNX 独有框数（判据之一） }
+        unmatched_workstation: { type: integer, description: 与工作站 predict 口径的独有框数（仅报告） }
+        max_bbox_delta: { type: number, description: 归一化坐标最大绝对误差（判据） }
+        max_raw_delta: { type: number, description: 同张量原始输出最大绝对误差（仅报告） }
+        max_workstation_delta: { type: number, description: 与工作站检测器的框误差（仅报告） }
+        onnx_providers: { type: array, items: { type: string }, description: "onnxruntime providers，如 CPUExecutionProvider" }
+        labels: { type: array, items: { type: string } }
+        per_image: { type: array, items: { $ref: "#/components/schemas/ParityImageReport" } }
+        checked_at: { type: string, format: date-time }
+        reason: { type: [string, "null"], description: 未通过时的中文原因；通过为 null }
+        method: { type: string, description: 方法说明文案 }
+
+    ParityImageReport:
+      type: object
+      description: 单张图的一致性验收明细
+      properties:
+        image: { type: string }
+        torch_boxes: { type: integer }
+        onnx_boxes: { type: integer }
+        matched: { type: integer }
+        max_raw_delta: { type: number }
+        max_bbox_delta: { type: number }
+        workstation_boxes: { type: integer }
+        max_workstation_delta: { type: number }
+
+    ModelExportResult:
+      type: object
+      required: [model_id, run_id, package, registered]
+      properties:
+        model_id: { type: integer }
+        run_id: { type: integer, description: 本次导出新建的 runs 行（kind=export） }
+        package: { $ref: "#/components/schemas/ExportPackage" }
+        parity:
+          description: 一致性验收报告；`verify=false` 时为 null
+          oneOf:
+            - $ref: "#/components/schemas/ParityReport"
+            - type: "null"
+        registered: { type: boolean, description: "= parity is None or parity.passed；false 表示未登记 onnx_path" }
+
+    GateDecision:
+      type: object
+      required: [passed, reasons, delta, thresholds, checked_at]
+      description: |
+        门禁结论（`gate.compare_metrics`，写入 `model_versions.gate_json`）。
+        判据为**相对基线**的差值 + 绝对下限：整体 mAP50 下降超过 `map50_tolerance`、
+        任一类别 mAP50 下降超过 `per_class_tolerance`（某类由 >0 掉到 0 记为「类别塌陷」）、
+        候选 mAP50 低于 `min_map50`、任一类召回低于 `min_class_recall`，任一命中即不通过。
+        默认阈值见 configs/train.yaml 的 gate。
+      properties:
+        passed: { type: boolean }
+        reasons: { type: array, items: { type: string }, description: 不通过原因（中文，含类别与差值） }
+        notes: { type: array, items: { type: string }, description: 备注，如「无基线模型（首个模型）：仅按绝对下限判定」 }
+        delta:
+          type: object
+          description: 与基线的差值（无基线时为空对象）
+          properties:
+            map50: { type: number, description: 候选 − 基线（round 到 6 位） }
+            per_class_map50: { type: object, additionalProperties: { type: number } }
+        baseline:
+          description: 基线模型信息；无基线（首个模型或 gate.baseline=none）时为 null
+          oneOf:
+            - type: object
+              properties:
+                label: { type: [string, "null"], description: "如 yolo11s-road:2026.09.01-a" }
+                map50: { type: [number, "null"] }
+                model: { type: [object, "null"], description: "基线模型 {id,name,version,weights}" }
+            - type: "null"
+        candidate:
+          type: object
+          description: 候选模型评估摘要
+          properties:
+            map50: { type: [number, "null"] }
+            per_class_map50: { type: object, additionalProperties: { type: number } }
+            weights: { type: [string, "null"] }
+            weights_sha256: { type: [string, "null"] }
+            split: { type: [string, "null"] }
+            dataset: { type: [string, "null"] }
+        thresholds:
+          type: object
+          description: 本次判定使用的阈值（取自 configs/train.yaml 的 gate）
+          properties:
+            map50_tolerance: { type: number }
+            per_class_tolerance: { type: number }
+            min_map50: { type: number }
+            min_class_recall: { type: [number, "null"], description: null = 不检查每类召回 }
+        checked_at: { type: string, format: date-time }
+        evaluation_run:
+          type: object
+          description: 判定所依据的评估来源（validate 时写入）
+          properties:
+            split: { type: [string, "null"] }
+            dataset: { type: [string, "null"] }
+            map50: { type: [number, "null"] }
 
     StatsOverview:
       type: object

@@ -95,6 +95,71 @@ class PrelabelConfig:
 
 
 @dataclass
+class EvaluateConfig:
+    """评估口径（configs/train.yaml: evaluate）。"""
+
+    splits: tuple[str, ...] = ("val", "test")
+    export_failures: int = 20
+    sahi_ablation: bool = True
+    conf: float = 0.25
+    iou: float = 0.5
+    tiles: int = 0                 # >0 = 用该边长强制切片做对照；0 = prelabel.tile 的 auto 策略
+
+
+@dataclass
+class GateConfig:
+    """模型门禁阈值（configs/train.yaml: gate）。"""
+
+    baseline: str = "production"   # production | previous | none
+    map50_tolerance: float = 0.005
+    per_class_tolerance: float = 0.02
+    min_map50: float = 0.0         # 绝对下限（首个模型也要过）
+    min_class_recall: float | None = None
+
+
+@dataclass
+class ExportConfig:
+    """ONNX 导出与一致性验收（configs/train.yaml: export）。"""
+
+    opset: int = 17
+    dynamic_batch: bool = True
+    simplify: bool = True
+    half: bool = False
+    tolerance: float = 1e-3        # 导出包验收：ONNX 与 .pt 逐框坐标最大绝对误差
+
+
+@dataclass
+class TrainConfig:
+    """训练配置（configs/train.yaml）。"""
+
+    dataset: str | None = None
+    arch: str = "yolo11s.pt"
+    pretrained: bool = True
+    resume_from: str | None = None
+    imgsz: int = 640
+    epochs: int = 100
+    patience: int = 20
+    batch: int = 16
+    workers: int = 4
+    seed: int = 42
+    optimizer: str = "AdamW"
+    lr0: float = 0.001
+    lrf: float = 0.01
+    warmup_epochs: float = 3.0
+    cos_lr: bool = True
+    device: str = "auto"
+    amp: object = "auto"       # auto | True | False（auto = 有 CUDA 才开）
+    plots: bool = False
+    close_mosaic: int = 10
+    augment: dict[str, float] = field(default_factory=dict)
+    #: 垂直翻转会交换「横向/纵向」语义（ADR/roadmap 硬约束）。只有显式打开才允许非 0 flipud。
+    allow_vertical_flip: bool = False
+    evaluate: EvaluateConfig = field(default_factory=EvaluateConfig)
+    gate: GateConfig = field(default_factory=GateConfig)
+    export: ExportConfig = field(default_factory=ExportConfig)
+
+
+@dataclass
 class Config:
     """运行期配置（最小可用子集，未列出的键保留在 raw 中）。"""
 
@@ -106,6 +171,7 @@ class Config:
     thumb_long_edge: int = 512
     ingest: IngestConfig = field(default_factory=IngestConfig)
     prelabel: PrelabelConfig = field(default_factory=PrelabelConfig)
+    train: TrainConfig = field(default_factory=TrainConfig)
     lease_seconds: int = 1800
     review_sample_ratio: float = 0.2
     config_path: Path | None = None
@@ -144,6 +210,20 @@ class Config:
         return self.data_dir / "logs"
 
     @property
+    def runs_dir(self) -> Path:
+        """训练工作目录（ultralytics project；checkpoint/results.csv 落在这里）。"""
+        return self.data_dir / "runs"
+
+    @property
+    def train_logs_dir(self) -> Path:
+        return self.data_dir / "logs" / "runs"
+
+    @property
+    def exports_dir(self) -> Path:
+        """边缘导出包根目录（[M4] rdinspect infer 消费）。"""
+        return self.data_dir / "exports"
+
+    @property
     def weights_dir(self) -> Path:
         """模型权重缓存目录（下载的 .pt 落在这里，而不是进程 CWD）。"""
         return self.data_dir / "weights"
@@ -170,6 +250,7 @@ class Config:
             self.data_dir, self.raw_dir, self.frames_dir, self.tiles_dir,
             self.thumbs_dir, self.masks_dir, self.datasets_dir, self.logs_dir,
             self.weights_dir, self.ultralytics_dir, self.mpl_dir,
+            self.runs_dir, self.train_logs_dir, self.exports_dir,
         ):
             path.mkdir(parents=True, exist_ok=True)
         self.export_runtime_env()
@@ -214,6 +295,63 @@ def _deep_get(data: dict[str, Any], *keys: str, default: Any = None) -> Any:
             return default
         node = node[key]
     return node
+
+
+def _load_train(config_path: Path, raw: dict[str, Any]) -> TrainConfig:
+    """加载训练配置：默认取同目录 train.yaml（存在则合并），顶层 `train:` 键可覆盖。"""
+    override = raw.get("train")
+    if isinstance(override, dict):
+        train_raw = override          # 显式覆盖：overrides={"train": {...}} 直接顶替 train.yaml
+    else:
+        candidate = config_path.parent / "train.yaml"
+        train_raw = yaml.safe_load(candidate.read_text(encoding="utf-8")) if candidate.exists() else {}
+    train_raw = train_raw or {}
+    model_raw = train_raw.get("model") or {}
+    params = train_raw.get("train") or {}
+    augment = {str(k): float(v) for k, v in (train_raw.get("augment") or {}).items()
+               if isinstance(v, (int, float))}
+    eval_raw = train_raw.get("evaluate") or {}
+    gate_raw = train_raw.get("gate") or {}
+    export_raw = (train_raw.get("export") or {}).get("onnx") or {}
+    splits = eval_raw.get("splits") or ["val", "test"]
+    min_recall = gate_raw.get("min_class_recall")
+
+    known_params = {
+        "imgsz", "epochs", "patience", "batch", "workers", "seed", "optimizer", "lr0", "lrf",
+        "warmup_epochs", "cos_lr", "close_mosaic", "device", "amp", "plots",
+    }
+    return TrainConfig(
+        dataset=train_raw.get("dataset", {}).get("name") if isinstance(train_raw.get("dataset"), dict)
+        else train_raw.get("dataset"),
+        arch=str(model_raw.get("arch", "yolo11s.pt")),
+        pretrained=bool(model_raw.get("pretrained", True)),
+        resume_from=model_raw.get("resume_from"),
+        augment=augment,
+        allow_vertical_flip=bool(train_raw.get("allow_vertical_flip", False)),
+        evaluate=EvaluateConfig(
+            splits=tuple(str(s) for s in splits),
+            export_failures=int(eval_raw.get("export_failures", 20)),
+            sahi_ablation=bool(eval_raw.get("sahi_ablation", True)),
+            conf=float(eval_raw.get("conf", 0.25)),
+            iou=float(eval_raw.get("iou", 0.5)),
+            tiles=int(eval_raw.get("tiles", 0)),
+        ),
+        gate=GateConfig(
+            baseline=str(gate_raw.get("baseline", "production")),
+            map50_tolerance=float(gate_raw.get("map50_tolerance", 0.005)),
+            per_class_tolerance=float(gate_raw.get("per_class_tolerance", 0.02)),
+            min_map50=float(gate_raw.get("min_map50", 0.0)),
+            min_class_recall=None if min_recall is None else float(min_recall),
+        ),
+        export=ExportConfig(
+            opset=int(export_raw.get("opset", 17)),
+            dynamic_batch=bool(export_raw.get("dynamic_batch", True)),
+            simplify=bool(export_raw.get("simplify", True)),
+            half=bool(export_raw.get("half", False)),
+            tolerance=float((train_raw.get("export") or {}).get("tolerance", 1e-3)),
+        ),
+        **{key: params[key] for key in known_params if key in params},
+    )
 
 
 def load_config(path: str | Path | None = None, *, data_dir: str | Path | None = None,
@@ -287,6 +425,7 @@ def load_config(path: str | Path | None = None, *, data_dir: str | Path | None =
     return Config(
         raw=raw,
         prelabel=prelabel,
+        train=_load_train(config_path, raw),
         data_dir=Path(resolved_data_dir),
         host=str(_deep_get(raw, "server", "host", default="127.0.0.1")),
         port=int(_deep_get(raw, "server", "port", default=8787)),

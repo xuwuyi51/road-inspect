@@ -1,7 +1,8 @@
-"""FastAPI 应用：M1 端点集（导入 / 任务 / 标注 / 复核 / 数据集 / 统计）+ 静态标注台。
+"""FastAPI 应用：M1 端点集（导入 / 任务 / 标注 / 复核 / 数据集 / 统计）
++ M2 模型辅助标注（预标注/候选/掩膜/质量看板）+ M3 训练闭环（训练/评估/门禁/导出）。
 
-与 docs/openapi.yaml 保持一致；M1 未实现的端点（prelabel/train/models）留到 M2/M3，
-未实现时返回 501 与明确提示，避免前端误判。
+与 docs/openapi.yaml 保持一致；未实现的端点（M4 边缘推理 / M5 主动学习）返回 501 与明确提示，
+避免前端误判。
 """
 
 from __future__ import annotations
@@ -12,7 +13,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request, UploadFile
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, UploadFile
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -26,6 +28,9 @@ from ..prelabel.metrics import prelabel_metrics
 from ..prelabel.service import attach_mask_for_annotation, build_detector, prelabel_tasks
 from ..storage.db import init_db
 from ..storage.repo import Repo
+from ..train import export_onnx as export_mod
+from ..train import gate as gate_mod
+from ..train import service as train_service
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 UPLOAD_INBOX_NAME = "inbox"
@@ -122,6 +127,37 @@ class DatasetExportRequest(BaseModel):
     copy_images: bool = True
 
 
+class TrainRunRequest(BaseModel):
+    """训练请求（M3）：只暴露常用旋钮，其余走 configs/train.yaml。"""
+
+    dataset: str | None = None
+    name: str | None = None
+    version: str | None = None
+    arch: str | None = None
+    resume_from: str | None = None
+    epochs: int | None = Field(default=None, ge=1, le=2000)
+    imgsz: int | None = Field(default=None, ge=64, le=2048)
+    batch: int | None = Field(default=None, ge=1, le=256)
+    device: str | None = None
+    #: true = 同步等待训练完成（小样本/测试用）；false = 后台线程 + 轮询
+    wait: bool = False
+
+
+class ModelExportRequest(BaseModel):
+    opset: int | None = Field(default=None, ge=11, le=20)
+    dynamic_batch: bool | None = None
+    simplify: bool | None = None
+    half: bool | None = None
+    imgsz: int | None = Field(default=None, ge=64, le=2048)
+    verify: bool = True
+    tolerance: float | None = Field(default=None, gt=0, le=0.1)
+    parity_images: int = Field(default=8, ge=1, le=64)
+
+
+class ModelEvaluateRequest(BaseModel):
+    split: str | None = None
+
+
 # ─────────────────────────── 应用工厂 ───────────────────────────
 def create_app(config: Config | None = None, *, detector_factory=None,
                masker_factory=None) -> FastAPI:
@@ -150,6 +186,16 @@ def create_app(config: Config | None = None, *, detector_factory=None,
 
     app = FastAPI(title="road-inspect", version="0.1.0",
                   description="轻量级道路灾害巡查：采集 → 标注 → 复核 → 数据集冻结与导出")
+
+    # 启动对账：上一次进程被杀/重启后遗留的 running 运行收尾为 failed（否则会一直显示"训练中"）
+    try:
+        startup_conn = init_db(cfg.db_path)
+        try:
+            train_service.reconcile_stale_runs(Repo(startup_conn))
+        finally:
+            startup_conn.close()
+    except Exception:  # noqa: BLE001 - 对账失败不应阻止服务启动
+        pass
 
     def repo_dependency() -> Iterator[Repo]:
         conn = init_db(cfg.db_path)
@@ -486,6 +532,111 @@ def create_app(config: Config | None = None, *, detector_factory=None,
                   limit: int = Query(50, ge=1, le=500), repo: Repo = Depends(repo_dependency)) -> list[dict[str, Any]]:
         return repo.list_runs(kind=kind, status=status, limit=limit)
 
+    # ── 训练闭环（M3）──
+    @app.post("/api/train/runs", status_code=202)
+    def create_train_run(payload: TrainRunRequest, response: Response) -> dict[str, Any]:
+        try:
+            result = train_service.start_training(
+                cfg, dataset=payload.dataset, name=payload.name, version=payload.version,
+                arch=payload.arch, resume_from=payload.resume_from, epochs=payload.epochs,
+                imgsz=payload.imgsz, batch=payload.batch, device=payload.device,
+                actor="api", background=not payload.wait,
+            )
+        except DetectorUnavailable as exc:
+            raise HTTPException(status_code=501, detail=str(exc)) from exc
+        except Exception as exc:  # noqa: BLE001
+            raise handle(exc) from exc
+        run = result.get("run") or {}
+        if payload.wait:
+            # 同步模式：训练已结束，返回 200（202 的语义是"已接受、稍后完成"）
+            response.status_code = 200
+            return {"run": run, "request": result.get("request"), "splits": result.get("splits"),
+                    "model": result.get("model"), "cached": result.get("cached", False),
+                    "status": run.get("status"), "run_id": result.get("run_id")}
+        message = ("命中幂等：复用既有运行，未启动新训练" if result.get("cached")
+                   else "训练已在后台启动，请轮询 GET /api/train/runs/{run_id}")
+        return {"run": run, "request": result.get("request"), "splits": result.get("splits"),
+                "cached": result.get("cached", False), "run_id": result.get("run_id"),
+                "message": message}
+
+    @app.get("/api/train/runs/{run_id}")
+    def get_train_run(run_id: int, log_lines: int = Query(40, ge=0, le=2000),
+                      repo: Repo = Depends(repo_dependency)) -> dict[str, Any]:
+        try:
+            return train_service.run_detail(cfg, repo, run_id, log_lines=log_lines)
+        except Exception as exc:  # noqa: BLE001
+            raise handle(exc) from exc
+
+    @app.post("/api/train/runs/{run_id}/cancel")
+    def cancel_train_run(run_id: int, repo: Repo = Depends(repo_dependency)) -> dict[str, Any]:
+        try:
+            return train_service.cancel_training(repo, run_id, reason="api")
+        except Exception as exc:  # noqa: BLE001
+            raise handle(exc) from exc
+
+    # ── 模型评估 / 门禁 / 提升 / 导出（M3）──
+    @app.get("/api/models/registry")
+    def model_registry(repo: Repo = Depends(repo_dependency)) -> list[dict[str, Any]]:
+        return [gate_mod.model_summary(row) for row in repo.list_model_versions()]
+
+    @app.get("/api/models/{model_id}")
+    def get_model(model_id: int, repo: Repo = Depends(repo_dependency)) -> dict[str, Any]:
+        row = repo.get_model_version(model_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail=f"模型 {model_id} 不存在")
+        summary = gate_mod.model_summary(row)
+        try:
+            summary["evaluation"] = gate_mod.evaluation_of(row)
+            summary["train_metrics"] = gate_mod.model_metrics(row).get("train")
+        except Exception:  # noqa: BLE001 - 指标解析失败不应 500
+            summary["evaluation"] = {}
+        return summary
+
+    @app.post("/api/models/{model_id}/evaluate")
+    def evaluate_model(model_id: int, payload: ModelEvaluateRequest | None = None,
+                       repo: Repo = Depends(repo_dependency)) -> dict[str, Any]:
+        options = payload or ModelEvaluateRequest()
+        try:
+            return gate_mod.evaluate_model(cfg, repo, model_id, split=options.split, actor="api")
+        except DetectorUnavailable as exc:
+            raise HTTPException(status_code=501, detail=str(exc)) from exc
+        except Exception as exc:  # noqa: BLE001
+            raise handle(exc) from exc
+
+    @app.post("/api/models/{model_id}/validate")
+    def validate_model(model_id: int, payload: ModelEvaluateRequest | None = None,
+                       repo: Repo = Depends(repo_dependency)) -> dict[str, Any]:
+        options = payload or ModelEvaluateRequest()
+        try:
+            return gate_mod.validate_model(cfg, repo, model_id, split=options.split, actor="api")
+        except DetectorUnavailable as exc:
+            raise HTTPException(status_code=501, detail=str(exc)) from exc
+        except Exception as exc:  # noqa: BLE001
+            raise handle(exc) from exc
+
+    @app.post("/api/models/{model_id}/promote")
+    def promote_model(model_id: int, repo: Repo = Depends(repo_dependency)) -> dict[str, Any]:
+        try:
+            return gate_mod.promote_model(cfg, repo, model_id, actor="api")
+        except Exception as exc:  # noqa: BLE001
+            raise handle(exc) from exc
+
+    @app.post("/api/models/{model_id}/export")
+    def export_model(model_id: int, payload: ModelExportRequest | None = None,
+                     repo: Repo = Depends(repo_dependency)) -> dict[str, Any]:
+        options = payload or ModelExportRequest()
+        try:
+            return export_mod.export_onnx(
+                cfg, repo, model_id, opset=options.opset, dynamic_batch=options.dynamic_batch,
+                simplify=options.simplify, half=options.half, imgsz=options.imgsz,
+                verify=options.verify, tolerance=options.tolerance,
+                parity_images=options.parity_images, actor="api",
+            )
+        except DetectorUnavailable as exc:
+            raise HTTPException(status_code=501, detail=str(exc)) from exc
+        except Exception as exc:  # noqa: BLE001
+            raise handle(exc) from exc
+
     @app.get("/api/stats/overview")
     def stats_overview(repo: Repo = Depends(repo_dependency)) -> dict[str, Any]:
         return repo.overview()
@@ -505,10 +656,13 @@ def create_app(config: Config | None = None, *, detector_factory=None,
             lines.append(",".join("" if row[key] is None else str(row[key]) for key in row.keys()) + "\n")
         return PlainTextResponse("".join(lines), media_type="text/csv")
 
-    # ── 未实现（M2/M3）的端点：明确 501，避免前端误判 ──
+    # ── 兜底路由：未注册的 POST 一律 501，并说明"已实现到哪里"，避免前端误判 ──
     @app.post("/api/{rest:path}")
     def not_implemented(rest: str) -> None:  # pragma: no cover - 由更具体路由优先匹配
-        raise HTTPException(status_code=501, detail=f"/api/{rest} 属于 M2/M3（预标注/训练），M1 未实现")
+        raise HTTPException(
+            status_code=501,
+            detail=(f"/api/{rest} 未实现：当前版本已实现 M1–M3 端点（导入/标注/复核/预标注/训练/门禁/导出），"
+                    f"M4（边缘推理）与 M5（主动学习）规划中；已实现端点清单见 docs/06-api-spec.md"))
 
     # ── 静态标注台 ──
     index_file = STATIC_DIR / "index.html"
@@ -521,6 +675,17 @@ def create_app(config: Config | None = None, *, detector_factory=None,
             return HTMLResponse("<h1>road-inspect</h1><p>标注台文件缺失（src/rdinspect/api/static/index.html）</p>",
                                 status_code=500)
         return FileResponse(index_file, media_type="text/html")
+
+    @app.exception_handler(RequestValidationError)
+    def validation_error_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+        """参数校验失败统一 400（契约里的语义），而不是 FastAPI 默认的 422。"""
+        problems = [f"{'.'.join(str(part) for part in err.get('loc', []))}: {err.get('msg')}"
+                    for err in exc.errors()]
+        return JSONResponse(status_code=400, content={
+            "code": "http_400",
+            "message": "请求参数不合法：" + "；".join(problems[:5]),
+            "details": {"errors": [str(err.get("msg")) for err in exc.errors()]},
+        })
 
     @app.exception_handler(HTTPException)
     async def http_error(_: Request, exc: HTTPException) -> JSONResponse:

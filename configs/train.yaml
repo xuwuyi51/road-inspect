@@ -1,11 +1,11 @@
-# 训练配置（小样本首版；由 rdinspect train 读取）
+# 训练配置（小样本首版；由 rdinspect train / POST /api/train/runs 读取）
 dataset:
-  name: ds-2026w38            # 必须为 frozen 状态
+  name: ds-2026w38            # 必须为 frozen 状态（冻结即不可变，见 ADR-0005）
 
 model:
   arch: yolo11s.pt            # 边缘导出可用 yolo11n.pt（见 08-deployment §2.1）
   pretrained: true
-  resume_from: null           # 域适配微调时填上一版权重路径
+  resume_from: null           # 域适配微调时填上一版权重路径；填 last.pt 则续训
 
 train:
   imgsz: 640
@@ -19,6 +19,10 @@ train:
   lrf: 0.01
   warmup_epochs: 3
   cos_lr: true
+  close_mosaic: 10
+  device: auto                # auto | cpu | cuda | 0
+  amp: auto                   # auto = 有 CUDA 才开混合精度（CPU 上关掉更快）
+  plots: false                # true = 额外生成 ultralytics 图表（需 matplotlib，慢）
 
 augment:
   mosaic: 1.0
@@ -31,24 +35,33 @@ augment:
   hsv_s: 0.7
   hsv_v: 0.4
   fliplr: 0.5
-  flipud: 0.0                 # ⚠️ 必须为 0：垂直翻转会交换"横向/纵向"语义
+  flipud: 0.0                 # ⚠️ 硬约束：垂直翻转会交换"横向/纵向"语义，非 0 直接报错
   erasing: 0.2
+allow_vertical_flip: false    # 仅当你确认数据里不含横/纵向裂缝时再打开
 
 evaluate:
   splits: [val, test]
+  conf: 0.25                  # 固定阈值下的 P/R 与大小桶召回
+  iou: 0.5
+  sahi_ablation: true         # 切片开关对比（ADR-0006）
+  tiles: 0                    # >0 = 强制用该边长切片做对照（小图也能看出差异）；0 = 自动策略
+  export_failures: 20         # 导出失败样例数（漏检/误检/类别混淆）
   report:
     - per_class_metrics       # P/R/mAP50/mAP50-95
     - confusion_matrix
-    - size_bucket_recall      # small/medium/large
+    - size_bucket_recall      # small/medium/large（COCO 口径）
     - sahi_ablation           # 切片开关对比
-  export_failures: 20         # 导出失败样例数
 
 gate:
-  baseline: production        # 对比对象
-  map50_tolerance: 0.005
-  per_class_tolerance: 0.02   # 任一类下降不得超过（防类别塌陷）
+  baseline: production        # production | previous | none
+  map50_tolerance: 0.005      # 整体 mAP50 允许的下降幅度
+  per_class_tolerance: 0.02   # 任一类 mAP50 下降不得超过（防类别塌陷）
+  min_map50: 0.0              # 绝对下限：首个模型也要过。⚠️ 0.0 = 不做绝对把关（mAP50=0 的模型也会通过并给出告警）；
+                              # 真实数据上建议设 0.30，避免"没学到东西"的权重被提升为 production
+  min_class_recall: null      # 设为 0.3 之类的下限可强制每类召回（null = 不检查）
 
 export:
+  tolerance: 0.001            # 导出包验收：ONNX 与 .pt 逐框坐标最大绝对误差
   onnx:
     opset: 17
     dynamic_batch: true

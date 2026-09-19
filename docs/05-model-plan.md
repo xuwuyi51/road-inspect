@@ -37,6 +37,19 @@
 | 类别不均衡 | 垃圾类过采样 + copy-paste | 垃圾样本少，否则召回塌陷 |
 | 训练框架 | ultralytics（AGPL，内部自用） | 见 ADR-0003 的替换路径 |
 
+**M3 落地时补充的实现约定**（`configs/train.yaml` + `train/runner.py`）：
+
+| 项 | 落地方式 |
+|---|---|
+| 硬约束 | `augment.flipud ≠ 0` 直接抛配置错误（要开必须显式 `allow_vertical_flip: true`），见 ADR-0001/roadmap |
+| 幂等 | `run_key = sha256(数据集清单哈希 + 架构 + 初始权重指纹 + 全部超参 + 增强)`；重复提交复用既有运行，正在运行则 409 |
+| 断点 | `resume_from` 指向 `last.pt` 时按 ultralytics 的 `resume=True` 续训；指向 `best.pt`/第三方权重时当初始化权重用 |
+| 日志 | ultralytics 日志逐行落盘 `data/logs/runs/train-<run_id>-*.log`，每个 epoch 把指标增量写进 `runs.metrics_json.progress`（前端/CLI 可轮询） |
+| data.yaml | ultralytics 用自身 `datasets_dir` 解析相对的 `path:`，因此在 `data/runs/_data/` 生成绝对路径副本，冻结数据集本身不改（保持不可变） |
+| 训练分辨率 | 记录在 `model_versions.metrics_json.train_params`，评估/导出默认沿用同一 imgsz（否则指标不可比） |
+| 受限容器 | `/dev/shm` 不可写时 ultralytics 线程池建信号量会失败 → `train/compat.py` 自动退化为串行扫描（`RDINSPECT_SERIAL_SCAN=1` 可强制） |
+| 中断自愈 | 服务重启后遗留的 `running` 在启动对账时置 `failed`（`rdinspect runs --reconcile`），同配置可重新提交 |
+
 **训练阶段（两段式）**：
 1. **域预训练**：用 RDD2022/CRDDC 公开数据训练 3 类（横裂/纵裂/坑洞）→ 得到基础权重。
 2. **域适配微调**：加入自有数据 + 垃圾类 → 小学习率微调（`lr0=0.0005`，30–50 epochs），固定测试集评估。
@@ -63,7 +76,7 @@
 
 | 用途 | 权重 | 来源 | 许可 | 实测 |
 |---|---|---|---|---|
-| 病害检测（冷启动） | `yolo12s_RDD2022_best.pt`（RDD2022 训练，5 类：D00/D10/D20/D40/Repair） | HF `rezzzq/yolo12s-road-damage-rdd2022` | MIT | 10 张真实路面图 → 17 个候选，映射率 89.5%（`Repair` 按设计丢弃） |
+| 病害检测（冷启动） | `yolo12s_RDD2022_best.pt`（RDD2022 训练，5 类：D00/D10/D20/D40/Repair） | HF `rezzzq/yolo12s-road-damage-rdd2022` | MIT | 10 张真实路面图 → **18 个候选，映射率 100%**（修复通道顺序后复测；`Repair` 为未收录类，若出现会被丢弃并计数） |
 | 通用检测（打通链路） | `yolo11n.pt`（COCO 80 类） | ultralytics assets | AGPL-3.0 | 仅验证适配器，类别会全部落入 `unmapped` |
 | 裂缝掩膜 | `sam2.1_t.pt` | ultralytics assets | Apache-2.0 | 裂缝候选 → 掩膜宽度 16.6/55.0 px，长度 251/299 px |
 
@@ -87,6 +100,22 @@
 | 推理时延（GPU, 640） | ≤ 15ms/帧 | YOLO11s，含预处理 |
 | 边缘时延（CPU 4 线程, 640, YOLO11n ONNX） | ≥ 15 FPS | 满足 FR-8.5 |
 
+### 6.1 M3 实测口径与结果（120 张合成数据，yolo11n@320，CPU）
+
+| 口径 | mAP50 | mAP50-95 | P | R | 说明 |
+|---|---|---|---|---|---|
+| ultralytics `val`（门禁主判据） | 0.9125 | 0.7249 | 1.000 | 0.912 | 只在**有真值的类别**上取平均 |
+| 内部匹配（`train/matching.py`，VOC2010 全点 AP） | 0.9167 | — | 0.579 | 0.524 | 固定 conf=0.25 下的 P/R；AP 按"仅有真值的类"平均 |
+| 内部匹配（按类别表全量平均） | 0.7333 | — | — | — | 缺真值的类记 0，是保守口径，不要与官方数直接比 |
+
+- 两套实现相差 **0.004**（0.9167 vs 0.9125），互为交叉验证；差距来源是官方对每类做 101 点插值、内部做全点插值。
+- 分类别（官方）：纵向 0.995 / 坑洞 0.995 / 垃圾 0.995 / 横向 0.665；网裂在本次 val 划分中无实例（报告里显示 `—`，不是 0）。
+- 大小桶召回：medium 0.75、large 1.00、small 无真值（`null`）；合成数据的缺陷偏大，**真实细裂缝必须重新按 small 桶验收**。
+- **切片开关对比：关闭 0.9167 → 开启 0.047（384px 窗口，召回 0.76 → 0.05）**。原因是本数据集以大目标为主，切片把目标切碎。结论：切片不是"默认更好"，必须按数据类型开关（ADR-0006）；细裂缝/航拍数据要单独做对照再决定。
+- 失败样例导出：本次 val 仅 2 张含失败样例，叠加图落在 `data/runs/eval-<run_id>-*/failures/`。
+
+> 指标目标（§6 表）是**真实 3–5k 数据 + YOLO11s@640** 的目标；上表是打通链路的合成小样本结果，不能当作真实路况精度。
+
 ## 7. 导出与边缘部署
 
 | 项 | 方案 |
@@ -96,6 +125,9 @@
 | 后处理一致性 | NMS/切片合并/坐标还原代码在**工作站与边缘共用同一模块**，只由 `preprocess.json` 参数化 |
 | 量化 | 首选 FP16；INT8 需用冻结验证集校准并复测（目标掉点 ≤ 2 mAP50） |
 | 版本门禁 | 新权重在冻结测试集上不低于现役（容差 ±0.005 mAP50）；未通过仅可标 `candidate`，不得进 `production` |
+| M3 实际导出包 | `model.onnx` + `labels.txt`（类别 code，行号=类别下标）+ `preprocess.json`（letterbox/归一化/NMS 阈值）+ `manifest.json`（数据集清单哈希、训练/导出 run、门禁结论、权重与 ONNX 的 sha256）+ `parity.json` + `README.md`；目录 `data/exports/<name>-<version>/` |
+| M3 一致性验收 | 同一份居中 letterbox 张量分别喂 torch 与 onnxruntime：**逐框归一化坐标最大误差 ≤ 1e-3**（实测 1e-06，容差 1e-3），且两侧不得有独有框；结果写进 `parity.json` 与 `manifest.parity` |
+| 预处理一致性 | ultralytics `predict` 默认 `rect=True`（stride 对齐**非居中**填充）会与导出包不一致（同图分数差 ~2%）→ 工作站检测器显式 `rect=False`，实测与导出包逐框误差 0.0 |
 
 ## 8. 主动学习与迭代节奏
 

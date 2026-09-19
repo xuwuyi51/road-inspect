@@ -248,8 +248,8 @@ class Repo:
             "random": "RANDOM()",
             "fifo": "t.id ASC",
         }.get(strategy, "t.id ASC")
-        sql = f"""SELECT t.*, i.path AS image_path, i.source_kind
-                  FROM tasks t JOIN images i ON i.id = t.image_id"""
+        sql = """SELECT t.*, i.path AS image_path, i.source_kind
+                 FROM tasks t JOIN images i ON i.id = t.image_id"""
         if clauses:
             sql += " WHERE " + " AND ".join(clauses)
         sql += f" ORDER BY {order} LIMIT ?"
@@ -609,6 +609,43 @@ class Repo:
     def get_run(self, run_id: int) -> dict[str, Any] | None:
         return _dict(self.conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone())
 
+    def update_run(self, run_id: int, *, metrics: dict[str, Any] | None = None,
+                   log_path: str | None = None, merge_metrics: bool = True) -> dict[str, Any] | None:
+        """增量更新运行（训练每轮写进度用；merge_metrics=False 则整体替换）。"""
+        row = self.get_run(run_id)
+        if row is None:
+            return None
+        sets, params = [], []
+        if metrics is not None:
+            payload = metrics
+            if merge_metrics:
+                try:
+                    current = json.loads(row["metrics_json"] or "{}")
+                except json.JSONDecodeError:
+                    current = {}
+                if not isinstance(current, dict):
+                    current = {}
+                payload = {**current, **metrics}
+            sets.append("metrics_json = ?")
+            params.append(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        if log_path is not None:
+            sets.append("log_path = ?")
+            params.append(log_path)
+        if sets:
+            params.append(run_id)
+            with transaction(self.conn):
+                self.conn.execute(f"UPDATE runs SET {', '.join(sets)} WHERE id = ?", params)
+        return self.get_run(run_id)
+
+    def latest_run(self, kind: str, *, dataset_id: int | None = None) -> dict[str, Any] | None:
+        sql = "SELECT * FROM runs WHERE kind = ? AND status = 'succeeded'"
+        params: list[Any] = [kind]
+        if dataset_id is not None:
+            sql += " AND dataset_id = ?"
+            params.append(dataset_id)
+        sql += " ORDER BY id DESC LIMIT 1"
+        return _dict(self.conn.execute(sql, params).fetchone())
+
     def list_runs(self, *, kind: str | None = None, status: str | None = None,
                   limit: int = 50) -> list[dict[str, Any]]:
         clauses, params = [], []
@@ -700,6 +737,75 @@ class Repo:
             self._audit("model", f"{before['name']}:{before['version']}", "status", actor,
                         {"status": before["status"]}, {"status": status})
         return True
+
+    def get_model_version(self, model_id: int) -> dict[str, Any] | None:
+        return _dict(self.conn.execute("SELECT * FROM model_versions WHERE id = ?", (model_id,)).fetchone())
+
+    def resolve_model_version(self, ref: str | int) -> dict[str, Any] | None:
+        """按 id / `name:version` / `version` 解析模型；`production` 取当前生产模型。"""
+        if isinstance(ref, int) or (isinstance(ref, str) and ref.isdigit()):
+            return self.get_model_version(int(ref))
+        if not isinstance(ref, str):
+            return None
+        if ref in ("production", "latest"):
+            return self.production_model()
+        if ":" in ref:
+            name, version = ref.split(":", 1)
+            return _dict(self.conn.execute(
+                "SELECT * FROM model_versions WHERE name = ? AND version = ?", (name, version)).fetchone())
+        return _dict(self.conn.execute(
+            "SELECT * FROM model_versions WHERE version = ? ORDER BY id DESC LIMIT 1", (ref,)).fetchone())
+
+    def update_model_version(self, model_id: int, *, weights_path: str | None = None,
+                             onnx_path: str | None = None, labels_json: dict | None = None,
+                             metrics_json: dict | None = None, gate_json: dict | None = None,
+                             sha256: str | None = None, run_id: int | None = None,
+                             dataset_id: int | None = None, actor: str = "system") -> dict[str, Any] | None:
+        """更新模型登记信息（只覆盖显式传入的字段）。"""
+        before = self.get_model_version(model_id)
+        if before is None:
+            return None
+        fields: dict[str, Any] = {}
+        if weights_path is not None:
+            fields["weights_path"] = weights_path
+        if onnx_path is not None:
+            fields["onnx_path"] = onnx_path
+        if labels_json is not None:
+            fields["labels_json"] = json.dumps(labels_json, ensure_ascii=False, sort_keys=True)
+        if metrics_json is not None:
+            fields["metrics_json"] = json.dumps(metrics_json, ensure_ascii=False, sort_keys=True)
+        if gate_json is not None:
+            fields["gate_json"] = json.dumps(gate_json, ensure_ascii=False, sort_keys=True)
+        if sha256 is not None:
+            fields["sha256"] = sha256
+        if run_id is not None:
+            fields["run_id"] = run_id
+        if dataset_id is not None:
+            fields["dataset_id"] = dataset_id
+        if not fields:
+            return before
+        sets = ", ".join(f"{key} = ?" for key in fields)
+        with transaction(self.conn):
+            self.conn.execute(f"UPDATE model_versions SET {sets} WHERE id = ?",
+                              [*fields.values(), model_id])
+            self._audit("model", f"{before['name']}:{before['version']}", "update", actor,
+                        None, {key: str(value)[:200] for key, value in fields.items()})
+        return self.get_model_version(model_id)
+
+    def archive_other_production(self, keep_id: int, *, task: str = "detection",
+                                 actor: str = "system") -> list[int]:
+        """把同任务下其它 production 模型归档（保证同任务只有一个生产模型）。"""
+        rows = self.conn.execute(
+            "SELECT id, name, version FROM model_versions WHERE task = ? AND status = 'production' AND id != ?",
+            (task, keep_id)).fetchall()
+        archived: list[int] = []
+        for row in rows:
+            with transaction(self.conn):
+                self.conn.execute("UPDATE model_versions SET status = 'archived' WHERE id = ?", (row["id"],))
+                self._audit("model", f"{row['name']}:{row['version']}", "archive", actor,
+                            {"status": "production"}, {"status": "archived", "replaced_by": keep_id})
+            archived.append(int(row["id"]))
+        return archived
 
     # ─────────────────────── 忽略/删除标注（M2） ───────────────────────
     def delete_annotation(self, annotation_id: int, *, actor: str = "api") -> bool:

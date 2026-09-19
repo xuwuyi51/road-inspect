@@ -165,10 +165,16 @@ class TestApi(unittest.TestCase):
         self.assertTrue(csv_response.text.startswith("image_id,captured_at"))
 
     def test_unimplemented_endpoints_return_501(self) -> None:
-        """训练/模型晋级属 M3：当前必须明确 501，而不是静默 404 或假装成功。"""
-        response = self.client.post("/api/runs", json={"kind": "train", "dataset_id": 1})
+        """M4/M5（边缘推理/主动学习）端点必须明确 501，而不是静默 404 或假装成功。"""
+        response = self.client.post("/api/infer/jobs", json={"package": "demo", "input": "./data/inbox"})
         self.assertEqual(response.status_code, 501)
-        self.assertIn("M3", response.json()["message"])
+        self.assertIn("未实现", response.json()["message"])
+        self.assertIn("M4", response.json()["message"])
+
+    def test_training_endpoint_is_wired(self) -> None:
+        """M3 起 /api/train/runs 必须真实存在（数据集不存在 → 404，而不是 501）。"""
+        response = self.client.post("/api/train/runs", json={"dataset": "不存在的数据集"})
+        self.assertEqual(response.status_code, 404)
 
 
 if __name__ == "__main__":

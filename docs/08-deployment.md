@@ -68,6 +68,42 @@ WantedBy=default.target
   `YOLO_CONFIG_DIR`/`MPLCONFIGDIR`）；这样在受限文件系统（只读 home、容器）里也能导入 ultralytics。
 - 未安装 ML 依赖时：预标注端点返回 **501** 并给出安装命令，人工标注与数据集流程完全不受影响。
 
+### 1.5 训练闭环（M3）的依赖、目录与容器注意事项
+
+```bash
+# 训练/评估/导出的增量依赖（在 §1.4 的 torch+ultralytics 之上）
+.venv/bin/pip install onnx onnxruntime onnxslim -i https://pypi.tuna.tsinghua.edu.cn/simple
+```
+
+| 项 | 说明 |
+|---|---|
+| 训练工作目录 | `data/runs/run-<run_id>-<slug>/`（weights、results.csv、args.yaml）；**失败重跑会把旧目录改名 `.prev-<时刻>`**，避免陈旧的 results.csv 污染新指标 |
+| 运行日志 | `data/logs/runs/train-<run_id>-<slug>.log`（ultralytics 日志逐行落盘；异常连堆栈一起落盘） |
+| 评估产物 | `data/runs/eval-<run_id>-<dataset>-<split>/`：`report-<split>.md`、`metrics-<split>.json`、`failures/`（叠加图 + failures.json） |
+| 导出包 | `data/exports/<name>-<version>/`：`model.onnx`、`labels.txt`、`preprocess.json`、`manifest.json`、`parity.json`、`README.md`（该目录整体拷到边缘即可用） |
+| 训练数据 | 冻结数据集的 YOLO 导出用**硬链接**（同分区零拷贝），不额外占盘；`data/runs/_data/*.yaml` 只是绝对路径的 data.yaml 副本 |
+| GPU 训练 | 装了 CUDA 版 torch 后 `device: auto` 会自动用 GPU；`amp: auto` 只在 CUDA 下开混合精度。CPU 上 120 张 @320、30 epoch 实测 66 秒（YOLO11n） |
+
+⚠️ **容器/沙箱里的两个坑（本机实测）**：
+
+1. **`/dev/shm` 必须可写**。ultralytics 扫描标签时会建 `multiprocessing` 线程池，而线程池初始化
+   就要创建 POSIX 信号量（`/dev/shm`）。只读 `/dev/shm` 时训练会以
+   `PermissionError: [Errno 13] Permission denied` 失败，且报错点离真实原因很远。
+   程序侧已做兼容：`src/rdinspect/train/compat.py` 探测到信号量不可用时，把线程池换成串行扫描
+   （结果一致、只是慢一点；正常环境零影响）。Docker 里仍建议 `--shm-size=1g`（或 `--ipc=host`），
+   也可用 `RDINSPECT_SERIAL_SCAN=1` 强制串行。
+2. **把 `HOME`（或 `XDG_CACHE_HOME`）指向可写目录**。onnxruntime 启动时会持久化遥测设备 ID：
+   HOME 不可写时它会在**进程 CWD** 落一个 `:memory:.ses` 文件（本机实测；已加进 `.gitignore`，
+   容器里建议 `-e HOME=/tmp` 并挂载可写卷）。
+3. **无网环境要预热两个缓存**：ultralytics 首次画图会下载 `Arial.ttf`，且首次导入时会在
+   `YOLO_CONFIG_DIR` 写 `settings.json`。离线部署前请在联网机器上先跑一次 `rdinspect train`（或在
+   镜像里预置 `data/ultralytics/`），否则启动阶段会卡在字体下载上。
+
+- 训练端点同样是"缺依赖就降级"：未装 ML 依赖时 `POST /api/train/runs` 返回 **501** 并附安装命令，
+  标注/复核/数据集流程不受影响。
+- 门禁不通过返回 **409**（`model_versions.status` 保持 `candidate`），这是设计上的"拒绝发布"，
+  不是服务错误——排障时看 `gate_json.reasons` 与 `delta`。
+
 ## 2. 形态二：边缘（车载/巡检，离线）
 
 | 项 | 方案 |
@@ -75,7 +111,9 @@ WantedBy=default.target
 | 运行环境 | Linux x86_64（车载主机/NUC）或 Windows；Python 3.11 + onnxruntime（CPU 版约 40MB） |
 | 依赖 | 仅 `onnxruntime` + `pillow`/`opencv-headless` + `numpy`；**无数据库、无浏览器、无 ffmpeg 依赖**（视频输入时需 ffmpeg 或内置解码） |
 | 安装 | 拷贝导出包 + `rdinspect` wheel（离线 `pip install ./wheels/*.whl`） |
-| 运行 | `rdinspect infer --model ./exports/yolo11s-road-onnx --input /mnt/sd --out ./out --device cpu` |
+| 运行 | `rdinspect infer --model ./exports/yolo11s-road-onnx --input /mnt/sd --out ./out --device cpu`（M4 提供该 CLI） |
+| M3 已就绪的部分 | 导出包（含 `preprocess.json` 契约）与 `rdinspect.edge.onnx_runtime`：`package_detector(dir)` 直接得到与工作站一致的检测器（居中 letterbox + 类别映射 + 类别感知 NMS），M4 的 CLI 只是它的命令行外壳 |
+| 启动前校验 | `load_export_package()` 会读 `manifest.json`/`preprocess.json`/`labels.txt`，缺文件或类别数与模型不符时直接拒绝启动（M4 会补 manifest 与模型哈希的一致性校验） |
 | 加速 | 可选 TensorRT（NVIDIA 设备）、OpenVINO（Intel）；INT8 需在冻结验证集上复测掉点 |
 | 存储 | 结果 JSONL/CSV < 1MB/千帧；可选的现场截图按命中类别保存（默认关闭） |
 | 断点续跑 | `--resume` 记录已处理文件哈希；重复运行跳过已完成项 |
@@ -113,7 +151,7 @@ WantedBy=default.target
 | 项 | 做法 |
 |---|---|
 | 日志 | `data/logs/app.log`（按天轮转）；训练日志 `data/logs/runs/<run_id>.log` |
-| 运行视图 | `/api/runs` 提供状态与日志尾部；失败 run 保留 `error` 与 trace_id |
+| 运行视图 | `GET /api/runs`（列表）与 `GET /api/train/runs/{id}`（状态 + epoch 进度 + 日志尾部）；失败 run 保留 `error`（含堆栈，落在 `data/logs/runs/*.log`） |
 | 健康检查 | `/api/health` 返回 schema 版本、现役模型、GPU 可用性；systemd `ExecStartPost` 可做自检 |
 | 常见故障 | ① 模型未加载 → 检查 `model_versions.status='production'` 是否存在；② 预标注超时 → 降低 tile 尺寸或关 SAM；③ 训练 OOM → 降 batch/imgsz；④ 磁盘满 → 见 §3 |
 | 保留策略 | `thumbs/` 可重建（可随时删除）；`raw/` 与冻结数据集不可删；`exports/` 保留最近 3 个版本 |

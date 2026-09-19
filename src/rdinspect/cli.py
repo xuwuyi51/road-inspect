@@ -1,4 +1,4 @@
-"""命令行入口：rdinspect serve|import|tasks|dataset|export|stats|check。
+"""命令行入口：rdinspect serve|import|tasks|dataset|export|prelabel|train|model|runs|stats|check。
 
 设计与契约见 docs/06-api-spec.md §5；退出码：0 成功 / 2 参数错误 / 3 依赖缺失 / 4 运行失败 / 5 门禁未通过。
 """
@@ -13,18 +13,24 @@ from pathlib import Path
 from .config import Config, ConfigError, load_config
 from .core import datasets as datasets_mod
 from .core.ingest import import_path
+from .errors import ConflictError
 from .prelabel.detector import DetectorUnavailable, ml_available
 from .prelabel.metrics import prelabel_metrics
 from .prelabel.service import DEFAULT_WEIGHTS, prelabel_tasks
 from .storage.db import init_db
 from .storage.files import rebuild_thumbnails
 from .storage.repo import Repo
+from .train import export_onnx as export_mod
+from .train import gate as gate_mod
+from .train import service as train_service
+from .train.runner import build_train_request, register_trained_model, run_training, slugify
 
-EXIT_OK, EXIT_ARGS, EXIT_DEP, EXIT_RUN = 0, 2, 3, 4
+EXIT_OK, EXIT_ARGS, EXIT_DEP, EXIT_RUN, EXIT_GATE = 0, 2, 3, 4, 5
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="rdinspect", description="轻量级道路灾害巡查（M1：采集与标注闭环）")
+    parser = argparse.ArgumentParser(
+        prog="rdinspect", description="轻量级道路灾害巡查（M1 采集标注 / M2 模型辅助标注 / M3 训练闭环）")
     parser.add_argument("--config", help="配置文件路径（默认 configs/default.yaml）")
     parser.add_argument("--data-dir", help="数据根目录（覆盖配置）")
     parser.add_argument("--json", action="store_true", help="以 JSON 输出结果")
@@ -81,9 +87,42 @@ def _build_parser() -> argparse.ArgumentParser:
     quality = sub.add_parser("prelabel-metrics", help="预标注质量看板：采纳率与模型-人工一致性")
     quality.add_argument("--json", action="store_true")
 
-    models = sub.add_parser("models", help="模型注册表（M2 预标注权重）")
+    models = sub.add_parser("models", help="模型注册表：状态与门禁总览（M2 预标注 / M3 训练）")
     models.add_argument("--task", default=None)
     models.add_argument("--status", default=None)
+
+    train = sub.add_parser("train", help="训练闭环：微调 + 登记 candidate 模型（M3）")
+    train.add_argument("--dataset", help="已冻结数据集名（默认取 configs/train.yaml）")
+    train.add_argument("--name", help="模型名（默认 <arch>-road）")
+    train.add_argument("--version", help="模型版本（默认 <日期>-r<run_id>）")
+    train.add_argument("--arch", help="初始架构/权重（默认 yolo11s.pt）")
+    train.add_argument("--resume-from", dest="resume_from", help="在既有 .pt 上微调；传 last.pt 则续训")
+    train.add_argument("--epochs", type=int)
+    train.add_argument("--imgsz", type=int)
+    train.add_argument("--batch", type=int)
+    train.add_argument("--device")
+    train.add_argument("--no-register", action="store_true", help="只训练，不登记模型")
+
+    runs = sub.add_parser("runs", help="运行记录：列表 / 详情 / 取消")
+    runs.add_argument("--kind", default=None, help="train|evaluate|export|prelabel|ingest")
+    runs.add_argument("--status", default=None)
+    runs.add_argument("--limit", type=int, default=20)
+    runs.add_argument("--show", type=int, help="查看指定 run 的详情（含日志尾部）")
+    runs.add_argument("--tail", type=int, default=30, help="--show 时打印的日志行数")
+    runs.add_argument("--cancel", type=int, help="请求中止指定训练 run")
+    runs.add_argument("--reconcile", action="store_true",
+                      help="把上次进程中断遗留的 running 运行收尾为 failed")
+
+    model = sub.add_parser("model", help="模型动作：评估 / 门禁 / 提升生产 / 导出 ONNX（M3）")
+    model.add_argument("action", choices=["list", "show", "evaluate", "validate", "promote", "export"])
+    model.add_argument("--id", type=int, help="模型 id")
+    model.add_argument("--split", help="评估划分（默认 val）")
+    model.add_argument("--opset", type=int, help="ONNX opset（默认取配置）")
+    model.add_argument("--imgsz", type=int)
+    model.add_argument("--no-verify", action="store_true", help="导出后不做 ONNX↔.pt 一致性验收")
+    model.add_argument("--tolerance", type=float, help="一致性验收容差（默认 1e-3）")
+    model.add_argument("--dynamic-batch", action="store_true", help="导出动态 batch")
+    model.add_argument("--half", action="store_true", help="导出 FP16（仅 GPU 导出可用）")
 
     classes = sub.add_parser("classes", help="类别注册表：查看 / 新增 / 停用（扩展点，无需改代码）")
     classes.add_argument("action", choices=["list", "add", "disable", "enable"])
@@ -282,9 +321,167 @@ def _cmd_models(args: argparse.Namespace, config: Config) -> int:
         rows = repo.list_model_versions(task=args.task, status=args.status)
     finally:
         conn.close()
+    _print(args, [gate_mod.model_summary(row) for row in rows], text="\n".join(
+        f"[{row['status']:<10}] #{row['id']:<3} {row['name']}:{row['version']} "
+        f"mAP50={_fmt_metric(summary['map50'])} 门禁={_gate_text(summary)} weights={row['weights_path']}"
+        for row, summary in ((row, gate_mod.model_summary(row)) for row in rows)) or "（模型注册表为空）")
+    return EXIT_OK
+
+
+def _fmt_metric(value: object, digits: int = 4) -> str:
+    return "—" if not isinstance(value, (int, float)) else f"{float(value):.{digits}f}"
+
+
+def _gate_text(summary: dict) -> str:
+    gate = summary.get("gate")
+    if not gate:
+        return "未评估"
+    return "通过" if gate.get("passed") else f"未通过（{len(gate.get('reasons') or [])} 项）"
+
+
+def _cmd_train(args: argparse.Namespace, config: Config) -> int:
+    if not ml_available():
+        print("未安装 ML 依赖：请执行 .venv/bin/pip install -e '.[ml]'（详见 docs/08-deployment.md）", file=sys.stderr)
+        return EXIT_DEP
+    conn = init_db(config.db_path)
+    repo = Repo(conn)
+    try:
+        request = build_train_request(config, repo, dataset=args.dataset, arch=args.arch,
+                                      resume_from=args.resume_from, epochs=args.epochs,
+                                      imgsz=args.imgsz, batch=args.batch, device=args.device)
+        print(f"数据集 {request.dataset_name}（manifest {str(request.manifest_hash)[:12]}）·"
+              f" 划分 {datasets_mod.dataset_split_counts(request.data_yaml)}", file=sys.stderr)
+        print(f"架构 {request.arch} · 初始权重 {request.weights_init} · epochs {request.params['epochs']}"
+              f" · imgsz {request.params['imgsz']} · batch {request.params['batch']}"
+              f" · device {request.params['device']}", file=sys.stderr)
+
+        def _progress(epoch: int, metrics: dict[str, object]) -> None:
+            print(f"  epoch {epoch}: mAP50={_fmt_metric(metrics.get('map50'))} "
+                  f"mAP50-95={_fmt_metric(metrics.get('map50_95'))}", file=sys.stderr)
+
+        outcome = run_training(config, repo, request, progress=_progress)
+        model = None
+        if outcome.status == "succeeded" and not args.no_register:
+            model_name = args.name or f"{slugify(Path(request.arch).stem)}-road"
+            model = register_trained_model(config, repo, outcome, name=model_name,
+                                           version=args.version, actor="cli")
+    except DetectorUnavailable as exc:
+        print(f"训练不可用: {exc}", file=sys.stderr)
+        return EXIT_DEP
+    finally:
+        conn.close()
+    payload = {"run": outcome.as_dict(), "model": model}
+    _print(args, payload, text=(
+        f"run #{outcome.run_id}｜{outcome.status}｜epochs {outcome.epochs_done}｜"
+        f"mAP50 {_fmt_metric(outcome.metrics.get('map50'))}｜weights {outcome.weights_path}｜"
+        f"日志 {outcome.log_path}"
+        + (f"｜模型 {model['name']}:{model['version']} (#{model['id']})" if model else "")))
+    return EXIT_OK if outcome.status == "succeeded" else EXIT_RUN
+
+
+def _cmd_runs(args: argparse.Namespace, config: Config) -> int:
+    conn = init_db(config.db_path)
+    repo = Repo(conn)
+    try:
+        if args.reconcile:
+            fixed = train_service.reconcile_stale_runs(repo)
+            _print(args, {"reconciled": fixed},
+                   text=(f"已收尾 {len(fixed)} 个中断运行：{fixed}" if fixed else "没有需要收尾的运行"))
+            return EXIT_OK
+        if args.cancel:
+            payload = train_service.cancel_training(repo, args.cancel, reason="cli")
+            _print(args, payload, text=f"已请求取消 run #{args.cancel}：{payload['note']}")
+            return EXIT_OK
+        if args.show:
+            detail = train_service.run_detail(config, repo, args.show, log_lines=args.tail)
+            tail = detail.pop("log_tail", [])
+            _print(args, detail, text=(
+                f"run #{detail['id']}｜{detail['kind']}｜{detail['status']}｜"
+                f"epochs {detail.get('epochs_done')}｜weights {detail.get('weights_path')}\n"
+                + ("\n".join(tail[-args.tail:]) if tail else "（无日志）")))
+            return EXIT_OK
+        rows = repo.list_runs(kind=args.kind, status=args.status, limit=args.limit)
+    finally:
+        conn.close()
     _print(args, rows, text="\n".join(
-        f"{row['name']}:{row['version']} [{row['status']}] {row['task']} weights={row['weights_path']}"
-        for row in rows) or "（模型注册表为空）")
+        f"#{row['id']:<4} {row['kind']:<9} {row['status']:<10} {row['created_at']} "
+        f"{(row['error'] or '')[:60]}"
+        for row in rows) or "（无运行记录）")
+    return EXIT_OK
+
+
+def _cmd_model(args: argparse.Namespace, config: Config) -> int:
+    if args.action == "list":
+        return _cmd_models(argparse.Namespace(task=None, status=None, json=args.json), config)
+    if not args.id:
+        print(f"{args.action} 需要 --id", file=sys.stderr)
+        return EXIT_ARGS
+    conn = init_db(config.db_path)
+    repo = Repo(conn)
+    try:
+        if args.action == "show":
+            row = repo.get_model_version(args.id)
+            if row is None:
+                print(f"模型 {args.id} 不存在", file=sys.stderr)
+                return EXIT_RUN
+            payload = gate_mod.model_summary(row)
+            _print(args, payload, text=(
+                f"#{payload['id']} {payload['name']}:{payload['version']} [{payload['status']}]\n"
+                f"mAP50 {_fmt_metric(payload['map50'])}｜mAP50-95 {_fmt_metric(payload['map50_95'])}｜"
+                f"门禁 {_gate_text(payload)}｜weights {payload['weights_path']}\n"
+                f"分类别 mAP50：{json.dumps(payload['per_class_map50'], ensure_ascii=False)}\n"
+                f"导出包：{payload.get('onnx_path') or '（未导出）'}"))
+            return EXIT_OK
+        if args.action == "evaluate":
+            result = gate_mod.evaluate_model(config, repo, args.id, split=args.split, actor="cli")
+            metrics = result["metrics"]
+            _print(args, {"run_id": result["run_id"], "split": result["split"],
+                          "map50": metrics.get("ultralytics", {}).get("map50"),
+                          "per_class_map50": gate_mod.primary_per_class_map50(metrics),
+                          "artifacts": metrics.get("artifacts")},
+                   text=(f"评估完成 run #{result['run_id']}｜split {result['split']}｜"
+                         f"mAP50 {_fmt_metric(metrics.get('ultralytics', {}).get('map50'))}｜"
+                         f"报告 {metrics.get('artifacts', {}).get('report')}"))
+            return EXIT_OK
+        if args.action == "validate":
+            try:
+                result = gate_mod.validate_model(config, repo, args.id, split=args.split, actor="cli")
+            except ConflictError as exc:
+                print(f"门禁未通过: {exc}", file=sys.stderr)
+                return EXIT_GATE
+            _print(args, result["gate"], text=(f"门禁通过｜模型 #{args.id} → validated｜"
+                                               f"mAP50 {_fmt_metric(result['gate']['candidate']['map50'])}｜"
+                                               f"delta {json.dumps(result['gate']['delta'], ensure_ascii=False)}"))
+            return EXIT_OK
+        if args.action == "promote":
+            try:
+                result = gate_mod.promote_model(config, repo, args.id, actor="cli")
+            except ConflictError as exc:
+                print(f"提升失败: {exc}", file=sys.stderr)
+                return EXIT_GATE
+            _print(args, result, text=(f"模型 #{args.id} → production（已归档旧生产模型 {result['archived']}）"))
+            return EXIT_OK
+        if args.action == "export":
+            try:
+                result = export_mod.export_onnx(config, repo, args.id, opset=args.opset, imgsz=args.imgsz,
+                                                dynamic_batch=True if args.dynamic_batch else None,
+                                                half=True if args.half else None,
+                                                verify=not args.no_verify, tolerance=args.tolerance,
+                                                actor="cli")
+            except ConflictError as exc:
+                print(f"导出失败: {exc}", file=sys.stderr)
+                return EXIT_GATE
+            parity = result["parity"] or {}
+            _print(args, result, text=(
+                f"导出包 {result['package']['dir']}｜registered={result['registered']}｜"
+                f"一致性 {'通过' if parity.get('passed') else '未通过'}"
+                f"（max|Δbbox|={parity.get('max_bbox_delta')} ≤ {parity.get('tolerance')}）"))
+            return EXIT_OK if result["registered"] else EXIT_GATE
+    except DetectorUnavailable as exc:
+        print(f"模型动作不可用: {exc}", file=sys.stderr)
+        return EXIT_DEP
+    finally:
+        conn.close()
     return EXIT_OK
 
 
@@ -409,6 +606,7 @@ def main(argv: list[str] | None = None) -> int:
         "dataset": _cmd_dataset, "export": _cmd_export, "stats": _cmd_stats,
         "thumbs": _cmd_thumbs, "check": _cmd_check, "prelabel": _cmd_prelabel,
         "prelabel-metrics": _cmd_prelabel_metrics, "models": _cmd_models, "classes": _cmd_classes,
+        "train": _cmd_train, "runs": _cmd_runs, "model": _cmd_model,
     }
     handler = handlers[args.command]
     if args.command == "dataset" and args.action == "freeze" and not args.name:

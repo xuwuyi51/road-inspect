@@ -106,10 +106,17 @@ class UltralyticsDetector:
     def predict(self, image: Image.Image) -> list[Detection]:
         import numpy as np  # noqa: PLC0415
 
+        # ⚠️ ultralytics 把 numpy 彩色输入当作 **BGR**（见 LoadPilAndNumpy._single_check 的约定），
+        # 因此必须把 PIL 的 RGB 先转成 BGR 再喂进去；否则 R/B 通道被静默交换，精度下降且难排查。
+        frame = np.asarray(image.convert("RGB"))[:, :, ::-1]
         results = self._model.predict(
-            source=np.asarray(image.convert("RGB")),
+            source=frame,
             imgsz=self.imgsz, conf=self.conf, iou=self.iou, max_det=self.max_detections,
             device=self.device, verbose=False,
+            # ⚠️ rect=True（ultralytics predict 的默认值）会按 stride 对齐做**非居中**填充，
+            # 与导出包/边缘端使用的居中 letterbox 不一致（同一张图分数可差 ~2%）。
+            # 显式关掉，保证「工作站预标注」与「边缘 ONNX 推理」是同一套预处理。
+            rect=False,
         )
         if not results:
             return []

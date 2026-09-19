@@ -165,7 +165,7 @@ prelabel → 载入现役模型 → 切片推理（若大图）→ 合并 → �
 ```
 算法 → POST /api/datasets {filter...} → draft
      → POST /api/datasets/{id}/freeze → 固化清单 + 生成 data.yaml + 哈希
-     → POST /api/runs {dataset, config} → 训练任务（后台）
+     → POST /api/train/runs {dataset, …} → 训练任务（后台线程；202 + 轮询 GET /api/train/runs/{id}）
 train → 训练 → 评估（分类别指标）→ 写 runs/metrics
 gate → 与现役 production 权重对比（同测试集）→ pass/fail
      → pass: model_version = candidate→validated；人工确认 → production
